@@ -117,6 +117,7 @@ public class MainActivity extends Activity {
     }
     private final List<GalleryRow> displayRows = new ArrayList<>();
     private static final int FILTER_ALL = 0, FILTER_NOT_DL = 1, FILTER_JPG = 2, FILTER_RAW = 3, FILTER_DATE = 4;
+    private static final int REQ_PICK_PHOTO = 4101; // v0.4.1 出片导入系统照片选择器
     private int filterMode = FILTER_ALL;
     private String filterDate = null; // yyyyMMdd
     private TextView[] filterChips = new TextView[5];
@@ -125,6 +126,21 @@ public class MainActivity extends Activity {
     private Button formatBtn;
     private TextView formatWarnTv;
     private ConfirmCard connConfirm;
+
+    // 连接页 v0.4.1：最近作品（Edited 成品缩略图）
+    private LinearLayout worksRow;
+    private TextView worksEmptyTv;
+    private Button worksEmptyBtn;
+    private FrameLayout homeOverlay;
+    private ImageView homeBigIv;
+    private TextView homeBigNameTv;
+
+    // 照片页 v0.4.1：空状态引导卡
+    private LinearLayout photosEmptyCard;
+    private TextView photosEmptyTv;
+
+    // 遥控页 v0.4.1：未连接引导卡
+    private LinearLayout rcHintCardRef;
 
     // 遥控页 v0.3：间隔拍摄
     private EditText ivSecEt, ivCountEt;
@@ -162,7 +178,7 @@ public class MainActivity extends Activity {
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.4.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控/图传增强/相机管理功能待真机逐项验证；出片套装待真机看图验收）");
+        Diag.log("清木图传 v0.4.1 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控/图传增强/相机管理功能待真机逐项验证；出片套装待真机看图验收）");
         DownloadService.listener = new DownloadService.Listener() {
             @Override public void onJobStart(int index, int total, DownloadService.Job job) {
                 runOnUiThread(() -> {
@@ -205,6 +221,11 @@ public class MainActivity extends Activity {
                 });
             }
         };
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        refreshRecentWorks(); // 出片页保存成品后回到连接页，最近作品区立即跟上
     }
 
     @Override protected void onDestroy() {
@@ -296,7 +317,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.4.0", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.4.1", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -365,6 +386,8 @@ public class MainActivity extends Activity {
         if (idx != 2 && remote != null && remote.isLiveViewOn()) {
             remote.stopLiveView();
         }
+        if (idx == 0) refreshRecentWorks();
+        if (idx == 1) updatePhotosEmptyState();
     }
 
     // ---------- 连接页 ----------
@@ -484,6 +507,45 @@ public class MainActivity extends Activity {
         devCard.addView(profileTv, wrapMargin(6));
         col.addView(devCard);
 
+        // —— 功能总览卡组（v0.4.1）：四张卡一字排开，角标如实标注可用状态 ——
+        col.addView(txt("功能总览", 13, Ui.TEXT_DIM, true), wrapMargin(12));
+        LinearLayout featRow = new LinearLayout(this);
+        featRow.addView(featureCard(R.drawable.ic_download, "图传", "照片/视频下载到相册",
+                "需连接相机", false, () -> showPage(0)), featureLp(0));
+        featRow.addView(featureCard(R.drawable.ic_remote, "遥控监看", "实时取景与遥控拍摄",
+                "需连接相机", false, () -> showPage(2)), featureLp(1));
+        featRow.addView(featureCard(R.drawable.ic_edit, "出片", "水印边框与滤镜",
+                "可直接使用", true, () -> openEditorImport()), featureLp(1));
+        featRow.addView(featureCard(R.drawable.ic_sdcard, "相机管理", "格式化与存储卡信息",
+                "需连接相机", false, () -> showPage(0)), featureLp(1));
+        col.addView(featRow);
+
+        // —— 最近作品（v0.4.1）：Pictures/QingmuTuchuan/Edited 最近成品 ——
+        LinearLayout worksCard = card();
+        LinearLayout wkHead = new LinearLayout(this);
+        wkHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView wkIc = new ImageView(this);
+        wkIc.setImageDrawable(icon(R.drawable.ic_edit, Ui.ACCENT));
+        wkHead.addView(wkIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView wkTitle = txt("最近作品", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams wklp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wklp.setMargins(dp(8), 0, 0, 0);
+        wkHead.addView(wkTitle, wklp);
+        worksCard.addView(wkHead);
+        android.widget.HorizontalScrollView wkScroll = new android.widget.HorizontalScrollView(this);
+        wkScroll.setHorizontalScrollBarEnabled(false);
+        worksRow = new LinearLayout(this);
+        wkScroll.addView(worksRow);
+        worksCard.addView(wkScroll, wrapMargin(8));
+        worksEmptyTv = txt("还没有出片作品。点下方按钮，挑一张手机里的照片就能加水印边框、套滤镜，不用等相机。", 12, Ui.TEXT_DIM, false);
+        worksCard.addView(worksEmptyTv, wrapMargin(8));
+        worksEmptyBtn = btn("挑一张照片出片", R.drawable.ic_edit, true);
+        worksEmptyBtn.setOnClickListener(v -> openEditorImport());
+        LinearLayout.LayoutParams weblp = matchWrap(); weblp.setMargins(0, dp(8), 0, 0);
+        worksCard.addView(worksEmptyBtn, weblp);
+        col.addView(worksCard);
+
         readPhotosBtn = btn("读取照片", R.drawable.ic_badge_image, true);
         LinearLayout.LayoutParams rlp = matchWrap(); rlp.setMargins(0, dp(8), 0, 0);
         col.addView(readPhotosBtn, rlp);
@@ -537,7 +599,205 @@ public class MainActivity extends Activity {
         wuCheck.setChecked(prefs.getBoolean("wu", false));
         setMode(prefs.getBoolean("sta", false));
         connConfirm = new ConfirmCard(this, pageRoot);
+        buildHomeOverlay(pageRoot);
         return pageRoot;
+    }
+
+    /** v0.4.1：大图查看浮层（点最近作品弹出，看图/分享/关闭，自绘深色层非系统弹窗） */
+    private void buildHomeOverlay(FrameLayout pageRoot) {
+        homeOverlay = new FrameLayout(this);
+        homeOverlay.setBackgroundColor(0xF2000000);
+        homeOverlay.setVisibility(View.GONE);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(14), dp(14), dp(14), dp(14));
+        homeBigNameTv = txt("", 14, Ui.TEXT, true);
+        col.addView(homeBigNameTv);
+        homeBigIv = new ImageView(this);
+        homeBigIv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        LinearLayout.LayoutParams bivlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1);
+        bivlp.setMargins(0, dp(10), 0, 0);
+        col.addView(homeBigIv, bivlp);
+        LinearLayout row = new LinearLayout(this);
+        Button shareBtn = btn("分享", R.drawable.ic_share, true);
+        Button closeBtn = btn("关闭", R.drawable.ic_clear, false);
+        row.addView(shareBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        cblp.setMargins(dp(8), 0, 0, 0);
+        row.addView(closeBtn, cblp);
+        LinearLayout.LayoutParams rlp2 = matchWrap(); rlp2.setMargins(0, dp(10), 0, 0);
+        col.addView(row, rlp2);
+        shareBtn.setOnClickListener(v -> {
+            Uri uri = (Uri) homeOverlay.getTag();
+            if (uri == null) return;
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("image/jpeg");
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(send, "分享作品"));
+        });
+        closeBtn.setOnClickListener(v -> homeOverlay.setVisibility(View.GONE));
+        homeOverlay.addView(col, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        pageRoot.addView(homeOverlay);
+    }
+
+    /** v0.4.1：最近作品数据（仅内存：Uri + 名字 + 缩略图，LruCache 硬顶约 3MB） */
+    private static class WorkItem { Uri uri; String name; Bitmap thumb; }
+
+    private final android.util.LruCache<String, Bitmap> worksThumbCache =
+            new android.util.LruCache<String, Bitmap>(3 * 1024 * 1024) {
+                @Override protected int sizeOf(String key, Bitmap value) { return value.getByteCount(); }
+            };
+    private final java.util.Set<String> worksLoading = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+    /** 刷新连接页「最近作品」：后台查 MediaStore Edited 目录（新→旧，最多 8 张），UI 只绑缓存 */
+    private void refreshRecentWorks() {
+        if (worksRow == null) return;
+        bg.execute(() -> {
+            List<WorkItem> items = new ArrayList<>();
+            if (Build.VERSION.SDK_INT >= 29) {
+                String sel = MediaStore.MediaColumns.RELATIVE_PATH + "=?";
+                try (Cursor c = getContentResolver().query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME,
+                                MediaStore.MediaColumns.DATE_MODIFIED},
+                        sel, new String[]{"Pictures/QingmuTuchuan/Edited/"},
+                        MediaStore.MediaColumns.DATE_MODIFIED + " DESC")) {
+                    if (c != null) {
+                        int idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID);
+                        int nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME);
+                        while (c.moveToNext() && items.size() < 8) {
+                            WorkItem it = new WorkItem();
+                            it.uri = ContentUris.withAppendedId(
+                                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(idCol));
+                            it.name = c.getString(nameCol);
+                            it.thumb = worksThumbCache.get(it.uri.toString());
+                            items.add(it);
+                        }
+                    }
+                } catch (Exception e) {
+                    Diag.op("EDIT", "最近作品 MediaStore 查询失败：" + e.getMessage());
+                }
+            } else {
+                // API 26-28：成品文件就落在公共目录，直接列文件（新→旧）
+                File dir = new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES), "QingmuTuchuan/Edited");
+                File[] files = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".jpg"));
+                if (files != null) {
+                    java.util.Arrays.sort(files, (x, y) -> Long.compare(y.lastModified(), x.lastModified()));
+                    for (File f : files) {
+                        if (items.size() >= 8) break;
+                        WorkItem it = new WorkItem();
+                        it.uri = Uri.fromFile(f);
+                        it.name = f.getName();
+                        it.thumb = worksThumbCache.get(it.uri.toString());
+                        items.add(it);
+                    }
+                }
+            }
+            // 缺缩略图的在后台解码（约 240px 降采样，一张约 230KB）再回 UI 重绑
+            boolean needReload = false;
+            for (final WorkItem it : items) {
+                if (it.thumb != null) continue;
+                final String key = it.uri.toString();
+                synchronized (worksLoading) {
+                    if (worksLoading.contains(key)) continue;
+                    worksLoading.add(key);
+                }
+                needReload = true;
+                try {
+                    Bitmap t = ImageEditor.loadPreview(this, it.uri, 1, 240);
+                    if (t != null) worksThumbCache.put(key, t);
+                } catch (Exception e) {
+                    Diag.op("EDIT", "最近作品缩略图失败 " + it.name + "：" + e.getMessage());
+                } finally {
+                    worksLoading.remove(key);
+                }
+                it.thumb = worksThumbCache.get(key);
+            }
+            final List<WorkItem> fit = items;
+            final boolean again = needReload;
+            runOnUiThread(() -> bindRecentWorks(fit, again));
+        });
+    }
+
+    private void bindRecentWorks(List<WorkItem> items, boolean reloadOnceMore) {
+        if (worksRow == null) return;
+        worksRow.removeAllViews();
+        boolean empty = items.isEmpty();
+        worksEmptyTv.setVisibility(empty ? View.VISIBLE : View.GONE);
+        worksEmptyBtn.setVisibility(empty ? View.VISIBLE : View.GONE);
+        for (final WorkItem it : items) {
+            ImageView iv = new ImageView(this);
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            iv.setBackgroundColor(Ui.PANEL_ALT);
+            if (it.thumb != null) iv.setImageBitmap(it.thumb);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(72), dp(72));
+            lp.setMargins(0, 0, dp(8), 0);
+            iv.setOnClickListener(v -> showWorkBig(it));
+            worksRow.addView(iv, lp);
+        }
+        // 二次绑定：个别缩略图后到时补刷一次（bindRecentWorks 本身不再触发加载，无循环）
+        if (reloadOnceMore) bindRecentWorks(items, false);
+    }
+
+    private void showWorkBig(WorkItem it) {
+        if (homeOverlay == null) return;
+        homeOverlay.setTag(it.uri);
+        homeBigNameTv.setText(it.name);
+        homeBigIv.setImageBitmap(null);
+        homeOverlay.setVisibility(View.VISIBLE);
+        Diag.op("EDIT", "最近作品查看：" + it.name);
+        bg.execute(() -> {
+            final Bitmap b = ImageEditor.loadPreview(this, it.uri, 1, 1600);
+            runOnUiThread(() -> {
+                if (homeOverlay.getVisibility() == View.VISIBLE && it.uri.equals(homeOverlay.getTag())) {
+                    homeBigIv.setImageBitmap(b);
+                } else if (b != null) {
+                    b.recycle();
+                }
+            });
+        });
+    }
+
+    /** v0.4.1 功能总览小卡：矢量图标 + 名称 + 一句话 + 状态角标，点击跳对应页 */
+    private View featureCard(int iconRes, String name, String desc, String badge, boolean free, Runnable go) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackground(getDrawable(R.drawable.bg_card));
+        c.setPadding(dp(8), dp(10), dp(8), dp(10));
+        ImageView iv = new ImageView(this);
+        iv.setImageDrawable(icon(iconRes, Ui.ACCENT));
+        c.addView(iv, new LinearLayout.LayoutParams(dp(22), dp(22)));
+        TextView n = txt(name, 14, Ui.TEXT, true);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        nlp.setMargins(0, dp(6), 0, 0);
+        c.addView(n, nlp);
+        TextView d = txt(desc, 11, Ui.TEXT_DIM, false);
+        d.setMinLines(2);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dlp.setMargins(0, dp(2), 0, 0);
+        c.addView(d, dlp);
+        TextView b = txt(badge, 10, free ? Ui.ACCENT_TX : Ui.TEXT_DIM, true);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(6), dp(3), dp(6), dp(3));
+        b.setBackground(getDrawable(free ? R.drawable.bg_btn_primary : R.drawable.bg_chip));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.setMargins(0, dp(6), 0, 0);
+        c.addView(b, blp);
+        c.setOnClickListener(v -> go.run());
+        return c;
+    }
+
+    private LinearLayout.LayoutParams featureLp(int pos) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        if (pos > 0) lp.setMargins(dp(6), 0, 0, 0);
+        return lp;
     }
 
     /** 格式化入口门控：仅当诊断页实验开关开启时可见（默认隐藏，防误触高危操作） */
@@ -627,6 +887,21 @@ public class MainActivity extends Activity {
         autoBannerTv.setPadding(dp(10), dp(6), dp(10), dp(6));
         autoBannerTv.setVisibility(View.GONE);
         col.addView(autoBannerTv);
+
+        // —— 空状态引导卡（v0.4.1）：未连接/还没有照片时说明能做什么，不留整页空白 ——
+        photosEmptyCard = new LinearLayout(this);
+        photosEmptyCard.setOrientation(LinearLayout.VERTICAL);
+        photosEmptyCard.setBackground(getDrawable(R.drawable.bg_card));
+        photosEmptyCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        LinearLayout.LayoutParams elp0 = matchWrap(); elp0.setMargins(0, 0, 0, dp(8));
+        photosEmptyCard.setLayoutParams(elp0);
+        photosEmptyTv = txt("", 13, Ui.TEXT_DIM, false);
+        photosEmptyCard.addView(photosEmptyTv);
+        Button emptyEditBtn = btn("挑一张照片出片（不用相机）", R.drawable.ic_edit, true);
+        emptyEditBtn.setOnClickListener(v -> openEditorImport());
+        LinearLayout.LayoutParams eelp = matchWrap(); eelp.setMargins(0, dp(10), 0, 0);
+        photosEmptyCard.addView(emptyEditBtn, eelp);
+        col.addView(photosEmptyCard);
 
         // —— 拍完自动回传卡 ——
         LinearLayout autoCard = card();
@@ -831,6 +1106,7 @@ public class MainActivity extends Activity {
         phConfirm = new ConfirmCard(this, pageRoot);
 
         updateAutoUi();
+        updatePhotosEmptyState();
         return pageRoot;
     }
 
@@ -925,6 +1201,23 @@ public class MainActivity extends Activity {
             }
         }
         if (adapter != null) adapter.notifyDataSetChanged();
+        updatePhotosEmptyState();
+    }
+
+    /** v0.4.1：照片页空状态——无任何行时显示引导（连线后能下什么）+ 出片直达，有行则收起 */
+    private void updatePhotosEmptyState() {
+        if (photosEmptyCard == null) return;
+        boolean empty = displayRows.isEmpty();
+        photosEmptyCard.setVisibility(empty ? View.VISIBLE : View.GONE);
+        if (!empty) return;
+        boolean connected = AppState.get().client != null && AppState.get().client.isConnected();
+        if (AppState.get().photos.isEmpty()) {
+            photosEmptyTv.setText(connected
+                    ? "已连接相机，但还没读取照片清单：点连接页的「读取照片」，或回到本页再点一次读取，相机卡上的照片会出现在这里，勾选后即可批量下载到相册（支持断点续传）。"
+                    : "还没有照片：先连接相机（连接页，相机热点或「连接至 PC」均可），再点「读取照片」，这里会出现相机卡里的照片墙，可勾选批量下载 JPEG/NEF 原图到相册，带断点续传与自动重连。");
+        } else {
+            photosEmptyTv.setText("当前筛选下没有照片（筛选条切回「全部」看全部 " + AppState.get().photos.size() + " 张）。");
+        }
     }
 
     private void refreshFilterChips() {
@@ -1104,6 +1397,7 @@ public class MainActivity extends Activity {
      * 出片入口分发：选中了已下载 JPG → 一张直达、多张弹选择；没选中 → 列全部已下载 JPG。
      * 出片对象是相册里的本地副本（Pictures/QingmuTuchuan），与相机连接状态无关；
      * NEF 没有可编辑的 JPG 本体，不进列表（配对时用同名 JPG 成员）。
+     * v0.4.1 起还可从「从手机选照片」导入系统相册任意 JPG（见 onEditChooserImport 按钮）。
      */
     private void onEditClicked() {
         List<String> picked = new ArrayList<>();
@@ -1121,17 +1415,19 @@ public class MainActivity extends Activity {
         }
         Collections.sort(all, Collections.reverseOrder());
         if (all.isEmpty()) {
-            Toast.makeText(this, "还没有已下载的 JPG：先把照片下载到相册，再点「出片」加水印边框/滤镜（只下了 NEF 时需连同名 JPG 一起下）",
-                    Toast.LENGTH_LONG).show();
-            Diag.op("EDIT", "出片入口：无已下载 JPG，提示先下载");
+            phOverlayShow("出片 · 选择照片");
+            phOverlayAddNote("还没有已下载的 JPG。不用等相机：直接从手机里挑一张照片就能出片——加 EXIF 水印边框、套滤镜，成品存相册 Edited 目录，原图不覆盖。");
+            phOverlayAddBtn("从手机选一张照片", true, this::openEditorImport);
+            Diag.op("EDIT", "出片入口：无已下载 JPG，给出系统照片导入入口");
             return;
         }
-        showEditChooser(all, "选择一张已下载的 JPG 出片（加 EXIF 水印边框 / 滤镜，成品存相册 Edited 目录，原图不覆盖）。");
+        showEditChooser(all, "选择一张已下载的 JPG 出片（加 EXIF 水印边框 / 滤镜，成品存相册 Edited 目录，原图不覆盖）。也可以从手机相册导入任意照片。");
     }
 
     private void showEditChooser(List<String> names, String note) {
         phOverlayShow("出片 · 选择照片");
         phOverlayAddNote(note);
+        phOverlayAddBtn("从手机选一张照片（导入）", true, this::openEditorImport);
         for (final String name : names) {
             phOverlayAddBtn(name, false, () -> openEditorFor(name));
         }
@@ -1180,6 +1476,61 @@ public class MainActivity extends Activity {
             }
         } catch (Exception e) {
             Diag.op("EDIT", "MediaStore 查询 " + filename + " 失败：" + e.getMessage());
+        }
+        return null;
+    }
+
+    /** v0.4.1：系统照片选择器导入（任意来源 JPG）→ 直接打开出片编辑页 */
+    private void openEditorImport() {
+        Intent pick;
+        if (Build.VERSION.SDK_INT >= 33) {
+            pick = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            pick.setType("image/jpeg");
+        } else {
+            pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            pick.addCategory(Intent.CATEGORY_OPENABLE);
+            pick.setType("image/jpeg");
+            pick.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        }
+        Diag.op("EDIT", "出片导入：打开系统照片选择器（" + (Build.VERSION.SDK_INT >= 33 ? "Photo Picker" : "OPEN_DOCUMENT") + "）");
+        startActivityForResult(pick, REQ_PICK_PHOTO);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_PHOTO) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            Diag.op("EDIT", "出片导入：用户取消");
+            return;
+        }
+        Uri uri = data.getData();
+        if (Build.VERSION.SDK_INT < 33) {
+            // 文档 Uri 尽量拿持久读权限（重启 App 后分享/重进仍可读；失败不阻断本次编辑）
+            try {
+                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (Exception e) {
+                Diag.op("EDIT", "出片导入：持久读权限获取失败（本次仍可编辑）：" + e.getMessage());
+            }
+        }
+        String name = queryDisplayName(uri);
+        if (name == null || name.isEmpty()) name = "imported.jpg";
+        Diag.op("EDIT", "出片导入选中：" + name + "（" + uri + "）");
+        Intent i = new Intent(this, EditorActivity.class);
+        i.setData(uri);
+        i.putExtra("name", name);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivity(i);
+    }
+
+    private String queryDisplayName(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri,
+                new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int col = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (col >= 0) return c.getString(col);
+            }
+        } catch (Exception e) {
+            Diag.op("EDIT", "出片导入：取文件名失败：" + e.getMessage());
         }
         return null;
     }
@@ -1253,6 +1604,26 @@ public class MainActivity extends Activity {
 
         rcStatusTv = txt("未连接相机（先到「连接」页连接）", 13, Ui.TEXT_DIM, false);
         col.addView(rcStatusTv, wrapMargin(2));
+
+        // —— 未连接引导卡（v0.4.1）：说明连上后能做什么 + 出片可直接用，不留死控件页 ——
+        LinearLayout rcHintCard = new LinearLayout(this);
+        rcHintCard.setOrientation(LinearLayout.VERTICAL);
+        rcHintCard.setBackground(getDrawable(R.drawable.bg_card));
+        rcHintCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        LinearLayout.LayoutParams rhclp = matchWrap(); rhclp.setMargins(0, dp(6), 0, dp(4));
+        rcHintCard.setLayoutParams(rhclp);
+        rcHintCard.addView(txt("连接相机后，这里可以：实时取景监看（流水线冲稳定 30fps）、点按对焦、遥控快门与录像、调光圈/快门/ISO/曝光补偿/白平衡、间隔拍摄，顶部还会显示相机状态（电量/剩余张数）。", 12, Ui.TEXT_DIM, false));
+        Button rcGoConnect = btn("去连接相机", R.drawable.ic_wifi, true);
+        rcGoConnect.setOnClickListener(v -> showPage(0));
+        LinearLayout.LayoutParams rgclp = matchWrap(); rgclp.setMargins(0, dp(10), 0, 0);
+        rcHintCard.addView(rcGoConnect, rgclp);
+        rcHintCard.addView(txt("不想等相机？出片不用连接：给手机里任意照片加 EXIF 水印边框、套滤镜。", 12, Ui.TEXT_DIM, false), wrapMargin(10));
+        Button rcGoEdit = btn("挑一张照片出片", R.drawable.ic_edit, false);
+        rcGoEdit.setOnClickListener(v -> openEditorImport());
+        LinearLayout.LayoutParams rgelp = matchWrap(); rgelp.setMargins(0, dp(8), 0, 0);
+        rcHintCard.addView(rcGoEdit, rgelp);
+        rcHintCardRef = rcHintCard;
+        col.addView(rcHintCard);
 
         // —— 相机状态面板 ——
         LinearLayout stCard = card();
@@ -1788,6 +2159,7 @@ public class MainActivity extends Activity {
             if (rcPropsBox != null) { rcPropsBox.removeAllViews(); rcAdjBox.removeAllViews(); }
             if (rcRemainTv != null) rcRemainTv.setText("剩余可拍：—");
             if (rcStatusTv != null) rcStatusTv.setText("未连接相机（先到「连接」页连接）");
+            if (rcHintCardRef != null) rcHintCardRef.setVisibility(View.VISIBLE);
             if (lvToggleBtn != null) lvToggleBtn.setText("开启取景");
             if (lvStateTv != null) lvStateTv.setText("未开启");
             if (lvNoteTv != null) lvNoteTv.setText("");
@@ -1930,6 +2302,7 @@ public class MainActivity extends Activity {
                 applyAutoSettings(); // 把自动回传设置（开关/范围）同步给新装配的中枢 + 刷新横幅
                 runOnUiThread(() -> {
                     rcStatusTv.setText("已连接 · " + model + "（遥控功能待真机逐项验证）");
+                    if (rcHintCardRef != null) rcHintCardRef.setVisibility(View.GONE);
                     refreshRemoteEnabled();
                 });
             } catch (Exception e) {

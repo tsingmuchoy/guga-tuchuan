@@ -64,6 +64,14 @@ public class EditorActivity extends Activity {
     private final List<TextView> frameChips = new ArrayList<>();
     private final List<TextView> filterChips = new ArrayList<>();
     private SeekBar strengthBar;
+    // v0.4.1：滤镜缩略图条（小样只算一次并缓存，约 180px；长按大图看原图对比）
+    private static final int THUMB_MAX = 180;
+    private Bitmap thumbBase;                    // 小样底图（srcPreview 的进一步降采样）
+    private final List<Bitmap> filterThumbs = new ArrayList<>(); // 与 filterChips 同序：原图 + 14 滤镜
+    private final List<ImageView> filterThumbIvs = new ArrayList<>();
+    private final List<View> filterThumbCells = new ArrayList<>();
+    private TextView compareHintTv;
+    private boolean comparing = false;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -87,6 +95,7 @@ public class EditorActivity extends Activity {
                 srcPreview = bmp;
                 String exifNote = meta.isEmpty() ? "（未读到 EXIF，水印只显示文件名）" : "";
                 statusTv.setText(meta.summary(srcName) + exifNote);
+                buildThumbStrip();
                 scheduleRender();
             });
         });
@@ -96,6 +105,8 @@ public class EditorActivity extends Activity {
         bg.shutdownNow();
         if (rendered != null && rendered != srcPreview) rendered.recycle();
         if (srcPreview != null) srcPreview.recycle();
+        for (Bitmap t : filterThumbs) if (t != null && t != thumbBase) t.recycle();
+        if (thumbBase != null) thumbBase.recycle();
         super.onDestroy();
     }
 
@@ -169,6 +180,24 @@ public class EditorActivity extends Activity {
         stlp.setMargins(0, dp(10), 0, 0);
         previewIv = new ImageView(this);
         previewIv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        // v0.4.1：长按大图显示原图（无边框无滤镜）对比，松手恢复当前效果
+        previewIv.setOnLongClickListener(v -> {
+            if (srcPreview == null || comparing) return false;
+            comparing = true;
+            previewIv.setImageBitmap(srcPreview);
+            if (compareHintTv != null) compareHintTv.setText("正在看原图，松手恢复当前效果");
+            return true;
+        });
+        previewIv.setOnTouchListener((v, ev) -> {
+            int act = ev.getActionMasked();
+            if (comparing && (act == android.view.MotionEvent.ACTION_UP
+                    || act == android.view.MotionEvent.ACTION_CANCEL)) {
+                comparing = false;
+                if (rendered != null) previewIv.setImageBitmap(rendered);
+                if (compareHintTv != null) compareHintTv.setText("长按预览图看原图对比，松手恢复");
+            }
+            return false; // 不拦截：让长按识别照常工作
+        });
         stage.addView(previewIv, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         exportBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -215,7 +244,7 @@ public class EditorActivity extends Activity {
         FrameLayout panelFrame = new FrameLayout(this);
         panelFrame.setBackground(getDrawable(R.drawable.bg_card));
         LinearLayout.LayoutParams pflp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(136));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(152));
         pflp.setMargins(0, dp(4), 0, 0);
         root.addView(panelFrame, pflp);
         toolPanels[0] = buildFramePanel();
@@ -296,19 +325,34 @@ public class EditorActivity extends Activity {
         HorizontalScrollView scroll = new HorizontalScrollView(this);
         scroll.setHorizontalScrollBarEnabled(false);
         LinearLayout row = new LinearLayout(this);
-        TextView none = chip("原图");
-        none.setOnClickListener(v -> setFilter(-1));
-        row.addView(none);
-        filterChips.add(none);
-        for (int i = 0; i < Filters.COUNT; i++) {
-            final int idx = i;
-            TextView c = chip(Filters.NAMES[i]);
-            c.setOnClickListener(v -> setFilter(idx));
+        // 第 0 格「原图」+ 14 个滤镜：每格一张实时渲染小样 + 名称（小样由 buildThumbStrip 填充）
+        String[] labels = new String[Filters.COUNT + 1];
+        labels[0] = "原图";
+        System.arraycopy(Filters.NAMES, 0, labels, 1, Filters.COUNT);
+        for (int i = 0; i < labels.length; i++) {
+            final int chipIdx = i;
+            LinearLayout cell = new LinearLayout(this);
+            cell.setOrientation(LinearLayout.VERTICAL);
+            cell.setGravity(Gravity.CENTER_HORIZONTAL);
+            cell.setPadding(dp(4), dp(4), dp(4), dp(4));
+            ImageView iv = new ImageView(this);
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            iv.setBackgroundColor(Ui.PANEL_ALT);
+            cell.addView(iv, new LinearLayout.LayoutParams(dp(56), dp(46)));
+            TextView name = txt(labels[i], 11, Ui.TEXT, true);
+            name.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            nlp.setMargins(0, dp(3), 0, 0);
+            cell.addView(name, nlp);
+            cell.setOnClickListener(v -> setFilter(chipIdx - 1));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(dp(8), 0, 0, 0);
-            row.addView(c, lp);
-            filterChips.add(c);
+            if (i > 0) lp.setMargins(dp(6), 0, 0, 0);
+            row.addView(cell, lp);
+            filterChips.add(name);
+            filterThumbIvs.add(iv);
+            filterThumbCells.add(cell);
         }
         scroll.addView(row);
         col.addView(scroll);
@@ -327,8 +371,10 @@ public class EditorActivity extends Activity {
         srow.addView(strengthValTv);
         LinearLayout.LayoutParams srlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        srlp.setMargins(0, dp(8), 0, 0);
+        srlp.setMargins(0, dp(6), 0, 0);
         col.addView(srow, srlp);
+        compareHintTv = txt("长按预览图看原图对比，松手恢复；小样为当前照片的实时渲染", 11, Ui.TEXT_DIM, false);
+        col.addView(compareHintTv);
         strengthBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
                 strength = progress;
@@ -342,6 +388,48 @@ public class EditorActivity extends Activity {
         return col;
     }
 
+    /**
+     * v0.4.1：滤镜小样生成——把预览图再降采样到约 180px 作底图，逐滤镜 100% 强度各渲染一张。
+     * 只算一次并缓存（filterThumbs），切换强度不重算小样；换照片（新开编辑页）才重算。
+     * 内存：底图约 180×120×4B ≈ 86KB，15 张小样合计约 1.3MB，用完随页面销毁回收。
+     */
+    private void buildThumbStrip() {
+        if (srcPreview == null) return;
+        final Bitmap src = srcPreview;
+        bg.execute(() -> {
+            int w = src.getWidth(), h = src.getHeight();
+            float k = Math.min(1f, (float) THUMB_MAX / Math.max(w, h));
+            Bitmap base = k < 1f ? Bitmap.createScaledBitmap(src, Math.max(1, Math.round(w * k)),
+                    Math.max(1, Math.round(h * k)), true) : src;
+            List<Bitmap> thumbs = new ArrayList<>();
+            thumbs.add(base); // 原图格直接用底图
+            for (int i = 0; i < Filters.COUNT; i++) {
+                Bitmap t = Bitmap.createBitmap(base.getWidth(), base.getHeight(), Bitmap.Config.ARGB_8888);
+                android.graphics.Canvas cv = new android.graphics.Canvas(t);
+                android.graphics.Paint p = new android.graphics.Paint();
+                p.setFilterBitmap(true);
+                p.setColorFilter(new android.graphics.ColorMatrixColorFilter(Filters.matrix(i, 100)));
+                cv.drawBitmap(base, 0, 0, p);
+                thumbs.add(t);
+            }
+            runOnUiThread(() -> {
+                if (isFinishing()) {
+                    for (Bitmap t : thumbs) if (t != base && t != src) t.recycle();
+                    if (base != src) base.recycle();
+                    return;
+                }
+                thumbBase = base;
+                filterThumbs.clear();
+                filterThumbs.addAll(thumbs);
+                for (int i = 0; i < filterThumbIvs.size() && i < thumbs.size(); i++) {
+                    filterThumbIvs.get(i).setImageBitmap(thumbs.get(i));
+                }
+                Diag.op("EDIT", "滤镜小样生成完成：" + thumbs.size() + " 张（约 " + THUMB_MAX
+                        + "px，100% 强度口径；切换强度不重算）");
+            });
+        });
+    }
+
     private void setFilter(int idx) {
         filterIdx = idx;
         dirty = true;
@@ -352,7 +440,13 @@ public class EditorActivity extends Activity {
     }
 
     private void refreshFilterChips() {
-        for (int i = 0; i < filterChips.size(); i++) styleChip(filterChips.get(i), i == filterIdx + 1);
+        // 选中态：小样格黄描边底 + 名称变黄（filterChips 与格子同序，0=原图对应 filterIdx=-1）
+        for (int i = 0; i < filterThumbCells.size(); i++) {
+            boolean on = i == filterIdx + 1;
+            filterThumbCells.get(i).setBackground(getDrawable(on
+                    ? R.drawable.bg_thumb_selected : R.drawable.bg_chip));
+            if (i < filterChips.size()) filterChips.get(i).setTextColor(on ? Ui.ACCENT : Ui.TEXT);
+        }
     }
 
     private View buildSavePanel() {
