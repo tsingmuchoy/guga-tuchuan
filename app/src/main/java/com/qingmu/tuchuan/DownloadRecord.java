@@ -128,6 +128,11 @@ public final class DownloadRecord {
 
     public static synchronized int count() { return MAP.size(); }
 
+    /** 全部已下载文件名副本（v0.4 出片选择器列「已下载 JPG」用） */
+    public static synchronized java.util.List<String> names() {
+        return new java.util.ArrayList<>(MAP.keySet());
+    }
+
     /** 记录文件当前字节数（体积量级汇报/诊断用） */
     public static synchronized long storeBytes() {
         return file != null && file.exists() ? file.length() : 0;

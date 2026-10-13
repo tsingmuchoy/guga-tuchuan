@@ -4,17 +4,24 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentUris;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.net.Network;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.MediaStore;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -34,6 +41,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -84,6 +92,7 @@ public class MainActivity extends Activity {
     private TextView autoJpgBtn, autoAllBtn;
     private TextView autoHintTv;
     private Button delBtn;
+    private Button editBtn; // v0.4 出片入口
     private ConfirmCard phConfirm;
     private FrameLayout phOverlay;
     private TextView phOvTitleTv;
@@ -139,6 +148,9 @@ public class MainActivity extends Activity {
     private TextView lvNoteTv, lvHintTv, ovTitleTv;
     private LinearLayout ovList;
     private CheckBox gridCheck, histCheck;
+    // 遥控页 v0.4：监看滤镜（View 层 ColorMatrixColorFilter 叠加，默认关）
+    private final List<TextView> lvFilterChips = new ArrayList<>();
+    private int lvFilterIdx = -1; // -1=关
     private volatile List<RemoteController.PropItem> propItems = new ArrayList<>();
     private float pendingAfNx = -1, pendingAfNy = -1;
 
@@ -150,7 +162,7 @@ public class MainActivity extends Activity {
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.3.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控/图传增强/相机管理功能待真机逐项验证）");
+        Diag.log("清木图传 v0.4.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控/图传增强/相机管理功能待真机逐项验证；出片套装待真机看图验收）");
         DownloadService.listener = new DownloadService.Listener() {
             @Override public void onJobStart(int index, int total, DownloadService.Job job) {
                 runOnUiThread(() -> {
@@ -284,7 +296,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.3.0", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.4.0", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -773,14 +785,20 @@ public class MainActivity extends Activity {
         LinearLayout dlRow = new LinearLayout(this);
         delBtn = btn("删除所选", R.drawable.ic_delete, false);
         delBtn.setTextColor(Ui.ERR);
+        editBtn = btn("出片", R.drawable.ic_edit, false);
         dlBtn = btn("下载所选到相册", R.drawable.ic_download, true);
         dlRow.addView(delBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout.LayoutParams edlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        edlp.setMargins(dp(8), 0, 0, 0);
+        dlRow.addView(editBtn, edlp);
         LinearLayout.LayoutParams drlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         drlp.setMargins(dp(8), 0, 0, 0);
         dlRow.addView(dlBtn, drlp);
         col.addView(dlRow);
         dlBtn.setOnClickListener(v -> onDownloadClicked());
         delBtn.setOnClickListener(v -> onDeleteClicked());
+        editBtn.setOnClickListener(v -> onEditClicked());
 
         // —— 通用列表弹层（配对选择 / 日期选择共用，自绘深色卡） ——
         phOverlay = new FrameLayout(this);
@@ -1080,6 +1098,92 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ---------- v0.4 出片入口 ----------
+
+    /**
+     * 出片入口分发：选中了已下载 JPG → 一张直达、多张弹选择；没选中 → 列全部已下载 JPG。
+     * 出片对象是相册里的本地副本（Pictures/QingmuTuchuan），与相机连接状态无关；
+     * NEF 没有可编辑的 JPG 本体，不进列表（配对时用同名 JPG 成员）。
+     */
+    private void onEditClicked() {
+        List<String> picked = new ArrayList<>();
+        for (PhotoItem p : selectedFiles()) {
+            if (p.kind() == PhotoItem.Kind.JPG && p.downloaded) picked.add(p.filename());
+        }
+        if (picked.size() == 1) { openEditorFor(picked.get(0)); return; }
+        if (picked.size() > 1) {
+            showEditChooser(picked, "已勾选多张已下载 JPG，选一张出片（一次编辑一张）。");
+            return;
+        }
+        List<String> all = new ArrayList<>();
+        for (String name : DownloadRecord.names()) {
+            if (PhotoItem.kindOf(name) == PhotoItem.Kind.JPG) all.add(name);
+        }
+        Collections.sort(all, Collections.reverseOrder());
+        if (all.isEmpty()) {
+            Toast.makeText(this, "还没有已下载的 JPG：先把照片下载到相册，再点「出片」加水印边框/滤镜（只下了 NEF 时需连同名 JPG 一起下）",
+                    Toast.LENGTH_LONG).show();
+            Diag.op("EDIT", "出片入口：无已下载 JPG，提示先下载");
+            return;
+        }
+        showEditChooser(all, "选择一张已下载的 JPG 出片（加 EXIF 水印边框 / 滤镜，成品存相册 Edited 目录，原图不覆盖）。");
+    }
+
+    private void showEditChooser(List<String> names, String note) {
+        phOverlayShow("出片 · 选择照片");
+        phOverlayAddNote(note);
+        for (final String name : names) {
+            phOverlayAddBtn(name, false, () -> openEditorFor(name));
+        }
+    }
+
+    /** 解析相册副本的 Uri（MediaStore 查询在后台线程），找到后打开编辑页 */
+    private void openEditorFor(final String filename) {
+        Diag.op("EDIT", "出片入口选中：" + filename + "，解析相册 Uri 中");
+        bg.execute(() -> {
+            Uri uri = findGalleryUri(filename);
+            if (uri == null) {
+                // API 26-28 或 MediaStore 未索引时退到文件路径（编辑器按 Uri 统一打开，file:// 亦可）
+                File f = new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES), "QingmuTuchuan/" + filename);
+                if (f.exists()) uri = Uri.fromFile(f);
+            }
+            final Uri fUri = uri;
+            runOnUiThread(() -> {
+                if (fUri == null) {
+                    Toast.makeText(this, "在相册里找不到 " + filename + "（可能已被移动或删除）", Toast.LENGTH_LONG).show();
+                    Diag.op("EDIT", "出片入口失败：相册里找不到 " + filename);
+                    return;
+                }
+                Intent i = new Intent(MainActivity.this, EditorActivity.class);
+                i.setData(fUri);
+                i.putExtra("name", filename);
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivity(i);
+            });
+        });
+    }
+
+    /** 在 MediaStore 里按文件名找 Pictures/QingmuTuchuan（不含 Edited 子目录）下的副本 Uri */
+    private Uri findGalleryUri(String filename) {
+        if (Build.VERSION.SDK_INT < 29) return null; // RELATIVE_PATH 列 29+ 才有，低版本走文件路径兜底
+        String[] proj = {MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH};
+        try (Cursor c = getContentResolver().query(MediaStore.Files.getContentUri("external"),
+                proj, MediaStore.MediaColumns.DISPLAY_NAME + "=?", new String[]{filename}, null)) {
+            if (c == null) return null;
+            int idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID);
+            int rpCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH);
+            while (c.moveToNext()) {
+                String rp = c.getString(rpCol);
+                if (rp != null && rp.contains("Edited")) continue; // 成品不再当原图编辑
+                return ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), c.getLong(idCol));
+            }
+        } catch (Exception e) {
+            Diag.op("EDIT", "MediaStore 查询 " + filename + " 失败：" + e.getMessage());
+        }
+        return null;
+    }
+
     // ---------- 诊断页 ----------
     private View buildDiagPage() {
         LinearLayout col = new LinearLayout(this);
@@ -1248,6 +1352,40 @@ public class MainActivity extends Activity {
         hclp.setMargins(dp(14), 0, 0, 0);
         lvOptRow.addView(histCheck, hclp);
         lvCard.addView(lvOptRow, wrapMargin(6));
+
+        // 监看滤镜（v0.4）：与出片共用 Filters 矩阵，挂在 ImageView 渲染层（ColorFilter），
+        // 不进拉帧/解码/呈现三线程——帧率与抖动诊断口径不变，开启后照样记 5s 汇总。
+        LinearLayout lvFilterRow = new LinearLayout(this);
+        lvFilterRow.setGravity(Gravity.CENTER_VERTICAL);
+        lvFilterRow.addView(txt("监看滤镜", 13, Ui.TEXT_DIM, false));
+        android.widget.HorizontalScrollView lvFilterScroll = new android.widget.HorizontalScrollView(this);
+        lvFilterScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout lvFilterBox = new LinearLayout(this);
+        TextView lvNoneChip = txt("关", 13, Ui.TEXT, true);
+        lvNoneChip.setGravity(Gravity.CENTER);
+        lvNoneChip.setPadding(dp(12), dp(6), dp(12), dp(6));
+        lvNoneChip.setOnClickListener(v -> applyLvFilter(-1));
+        lvFilterBox.addView(lvNoneChip);
+        lvFilterChips.add(lvNoneChip);
+        for (int i = 0; i < Filters.COUNT; i++) {
+            final int idx = i;
+            TextView c = txt(Filters.NAMES[i], 13, Ui.TEXT, true);
+            c.setGravity(Gravity.CENTER);
+            c.setPadding(dp(12), dp(6), dp(12), dp(6));
+            c.setOnClickListener(v -> applyLvFilter(idx));
+            LinearLayout.LayoutParams clp3 = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clp3.setMargins(dp(6), 0, 0, 0);
+            lvFilterBox.addView(c, clp3);
+            lvFilterChips.add(c);
+        }
+        lvFilterScroll.addView(lvFilterBox);
+        LinearLayout.LayoutParams lfslp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        lfslp.setMargins(dp(8), 0, 0, 0);
+        lvFilterRow.addView(lvFilterScroll, lfslp);
+        lvCard.addView(lvFilterRow, wrapMargin(6));
+        lvCard.addView(txt("监看滤镜只改手机预览效果，不影响相机原图与录像文件；「Log 还原」为通用近似（提对比/去灰），非尼康官方 N-Log 曲线。默认关。", 12, Ui.TEXT_DIM, false), wrapMargin(4));
+        refreshLvFilterChips();
 
         // 帧尺寸档：流畅（小帧锁帧率）/ 清晰（大帧看细节）；相机未提供 0xD1AC 时整行置灰
         LinearLayout sizeRow = new LinearLayout(this);
@@ -1428,6 +1566,32 @@ public class MainActivity extends Activity {
             lvSizeClearBtn.setText("清晰");
         }
         if (remote != null) lvStateTv.setText(remote.lvSizeLabel());
+    }
+
+    /** v0.4 监看滤镜开关：只给 lvImage 挂/摘 ColorFilter（渲染层），不动取景三线程与诊断口径 */
+    private void applyLvFilter(int idx) {
+        lvFilterIdx = idx;
+        if (lvImage != null) {
+            if (idx < 0) lvImage.setColorFilter(null);
+            else lvImage.setColorFilter(new ColorMatrixColorFilter(Filters.matrix(idx, 100)));
+        }
+        refreshLvFilterChips();
+        if (idx < 0) {
+            Diag.op("LVFILTER", "监看滤镜 → 关（默认）");
+        } else {
+            Diag.op("LVFILTER", "监看滤镜 → " + Filters.NAMES[idx]
+                    + (Filters.isLog(idx) ? "（通用近似，非尼康官方 N-Log 曲线）" : "")
+                    + "：ImageView 渲染层 ColorMatrix 叠加，不进拉帧/解码/呈现链；帧率与抖动诊断照常记录，真机若拖累帧率由自适应锁档处理");
+            if (rcStatusTv != null) rcStatusTv.setText("监看滤镜：" + Filters.NAMES[idx] + "（仅预览，不影响原图）");
+        }
+    }
+
+    private void refreshLvFilterChips() {
+        for (int i = 0; i < lvFilterChips.size(); i++) {
+            boolean on = i == lvFilterIdx + 1;
+            lvFilterChips.get(i).setBackground(getDrawable(on ? R.drawable.bg_btn_primary : R.drawable.bg_btn_ghost));
+            lvFilterChips.get(i).setTextColor(on ? Ui.ACCENT_TX : Ui.TEXT);
+        }
     }
 
     /** 渲染状态面板（只读项）与参数调节区（可调项）；remainText=null 表示不更新剩余张数行 */
