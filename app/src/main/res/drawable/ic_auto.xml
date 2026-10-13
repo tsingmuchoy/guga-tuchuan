@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 自动回传：一对上下箭头（同步/回传） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M7,3.2 L11.2,8.6 L8.7,8.6 L8.7,15.4 L5.3,15.4 L5.3,8.6 L2.8,8.6 Z M17,20.8 L12.8,15.4 L15.3,15.4 L15.3,8.6 L18.7,8.6 L18.7,15.4 L21.2,15.4 Z"/>
+</vector>

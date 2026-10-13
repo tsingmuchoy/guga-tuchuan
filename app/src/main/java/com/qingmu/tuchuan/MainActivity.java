@@ -78,6 +78,50 @@ public class MainActivity extends Activity {
     private ProgressBar dlBar;
     private Button dlBtn;
 
+    // 照片页 v0.3：自动回传 / 筛选 / 配对 / 删除 / 相机管理
+    private TextView autoBannerTv;
+    private CheckBox autoDlCheck;
+    private TextView autoJpgBtn, autoAllBtn;
+    private TextView autoHintTv;
+    private Button delBtn;
+    private ConfirmCard phConfirm;
+    private FrameLayout phOverlay;
+    private TextView phOvTitleTv;
+    private LinearLayout phOvList;
+    /** 图库展示行（配对折叠后）；PhotoItem 仍是数据本体，行只是视图聚合 */
+    private static class GalleryRow {
+        PhotoItem a, b; // b 非空 = RAW+JPG 配对行（a/b 顺序为列表出现序）
+        GalleryRow(PhotoItem a) { this.a = a; }
+        boolean isPair() { return b != null; }
+        java.util.List<PhotoItem> files() {
+            java.util.List<PhotoItem> r = new ArrayList<>();
+            r.add(a); if (b != null) r.add(b);
+            return r;
+        }
+        PhotoItem jpgMember() {
+            if (a.kind() == PhotoItem.Kind.JPG) return a;
+            if (b != null && b.kind() == PhotoItem.Kind.JPG) return b;
+            return a;
+        }
+        int selectedCount() { int n = 0; for (PhotoItem p : files()) if (p.selected) n++; return n; }
+        int downloadedCount() { int n = 0; for (PhotoItem p : files()) if (p.downloaded) n++; return n; }
+    }
+    private final List<GalleryRow> displayRows = new ArrayList<>();
+    private static final int FILTER_ALL = 0, FILTER_NOT_DL = 1, FILTER_JPG = 2, FILTER_RAW = 3, FILTER_DATE = 4;
+    private int filterMode = FILTER_ALL;
+    private String filterDate = null; // yyyyMMdd
+    private TextView[] filterChips = new TextView[5];
+
+    // 连接页 v0.3：相机管理（格式化）
+    private Button formatBtn;
+    private TextView formatWarnTv;
+    private ConfirmCard connConfirm;
+
+    // 遥控页 v0.3：间隔拍摄
+    private EditText ivSecEt, ivCountEt;
+    private Button ivBtn;
+    private TextView ivStatusTv;
+
     // 诊断页
     private TextView diagTv;
     private ScrollView diagScroll;
@@ -102,10 +146,11 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("guga_tuchuan", MODE_PRIVATE);
         thumbCache = new ThumbCache(this);
+        DownloadRecord.init(this);
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.2.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控功能待真机逐项验证）");
+        Diag.log("清木图传 v0.3.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控/图传增强/相机管理功能待真机逐项验证）");
         DownloadService.listener = new DownloadService.Listener() {
             @Override public void onJobStart(int index, int total, DownloadService.Job job) {
                 runOnUiThread(() -> {
@@ -133,12 +178,28 @@ public class MainActivity extends Activity {
                 });
             }
         };
+        IntervalService.listener = new IntervalService.Listener() {
+            @Override public void onProgress(int done, int total) {
+                runOnUiThread(() -> {
+                    if (ivStatusTv != null) ivStatusTv.setText("间隔拍摄中：已拍 " + done + (total > 0 ? "/" + total : "") + " 张");
+                    if (ivBtn != null) ivBtn.setText("停止间隔拍摄");
+                });
+            }
+            @Override public void onFinished(int done, String error) {
+                runOnUiThread(() -> {
+                    if (ivBtn != null) ivBtn.setText("开始间隔拍摄");
+                    if (ivStatusTv != null) ivStatusTv.setText(error != null ? error : "间隔拍摄结束：共拍 " + done + " 张");
+                    if (error != null) Toast.makeText(MainActivity.this, error, Toast.LENGTH_LONG).show();
+                });
+            }
+        };
     }
 
     @Override protected void onDestroy() {
         teardownRemote();
         Diag.setListener(null);
         DownloadService.listener = null;
+        IntervalService.listener = null;
         super.onDestroy();
     }
 
@@ -223,7 +284,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.2.0", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.3.0", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -296,10 +357,12 @@ public class MainActivity extends Activity {
 
     // ---------- 连接页 ----------
     private View buildConnectPage() {
+        FrameLayout pageRoot = new FrameLayout(this);
         ScrollView scroll = new ScrollView(this);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(col);
+        pageRoot.addView(scroll);
 
         // 入口切换
         LinearLayout modeRow = new LinearLayout(this);
@@ -431,6 +494,29 @@ public class MainActivity extends Activity {
         aboutCard.addView(txt("无 Wi-Fi 的机型（如仅蓝牙的 D3400/D3500）没有任何 PTP/IP 入口，物理上无法使用本 App。老机型插上 WU-1a/1b 无线适配器后，勾选上方「经 WU 适配器」再连接。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
         col.addView(aboutCard);
 
+        // —— 相机管理卡（v0.3）：格式化存储卡。高危：入口被实验开关门控（诊断页，未开不可见） ——
+        LinearLayout mgmtCard = card();
+        LinearLayout mgHead = new LinearLayout(this);
+        mgHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView mgIc = new ImageView(this);
+        mgIc.setImageDrawable(icon(R.drawable.ic_sdcard, Ui.ACCENT));
+        mgHead.addView(mgIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView mgTitle = txt("相机管理", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams mglp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        mglp.setMargins(dp(8), 0, 0, 0);
+        mgHead.addView(mgTitle, mglp);
+        mgmtCard.addView(mgHead);
+        formatWarnTv = txt("格式化会清空当前存储卡上的全部照片与视频，不可恢复。本功能未经真机验证，强烈建议先拿一张空卡/废卡试，不要对主力卡首次使用。", 12, Ui.TEXT_DIM, false);
+        mgmtCard.addView(formatWarnTv, wrapMargin(8));
+        formatBtn = btn("格式化存储卡", R.drawable.ic_delete, false);
+        formatBtn.setTextColor(Ui.ERR);
+        LinearLayout.LayoutParams fblp = matchWrap(); fblp.setMargins(0, dp(8), 0, 0);
+        mgmtCard.addView(formatBtn, fblp);
+        formatBtn.setOnClickListener(v -> onFormatClicked());
+        col.addView(mgmtCard);
+        updateFormatVisibility();
+
         // 回填上次连接信息
         ssidEt.setText(prefs.getString("ssid", ""));
         passEt.setText(prefs.getString("pass", ""));
@@ -438,7 +524,61 @@ public class MainActivity extends Activity {
         portEt.setText(prefs.getString("port", "15740"));
         wuCheck.setChecked(prefs.getBoolean("wu", false));
         setMode(prefs.getBoolean("sta", false));
-        return scroll;
+        connConfirm = new ConfirmCard(this, pageRoot);
+        return pageRoot;
+    }
+
+    /** 格式化入口门控：仅当诊断页实验开关开启时可见（默认隐藏，防误触高危操作） */
+    private void updateFormatVisibility() {
+        boolean on = prefs != null && prefs.getBoolean("remote_exp", false);
+        if (formatBtn != null) formatBtn.setVisibility(on ? View.VISIBLE : View.GONE);
+        if (formatWarnTv != null) formatWarnTv.setVisibility(on ? View.VISIBLE : View.GONE);
+    }
+
+    /** 格式化两段确认：①普通确认卡讲清后果 → ②长按 2 秒确认卡 → 才真正发 FormatStore */
+    private void onFormatClicked() {
+        AppState st = AppState.get();
+        if (!st.sessionReady() || st.storageId == 0) {
+            Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final int sid = st.storageId;
+        final String desc = (st.storageDesc != null && !st.storageDesc.isEmpty()) ? st.storageDesc : "存储卡";
+        Diag.op("FORMAT", "用户点开格式化流程（尚未执行）：存储=" + desc + " storageId=0x" + Integer.toHexString(sid));
+        connConfirm.show("格式化存储卡？",
+                "目标：" + desc + "\n\n格式化将清空这张卡上的全部照片与视频，删除后不可恢复（已下载到手机相册的副本不受影响）。\n\n本功能未经真机验证，请勿对主力卡首次使用。",
+                "继续", true,
+                () -> connConfirm.showLongPress("最后确认：格式化",
+                        "再次确认：即将格式化「" + desc + "」，卡上全部内容将被清空。\n\n请按住下方按钮满 2 秒执行，松手即取消。",
+                        "长按确认格式化", 2000,
+                        () -> doFormat(sid, desc)));
+    }
+
+    private void doFormat(final int storageId, final String desc) {
+        Diag.op("FORMAT", "双重确认完成，执行 FormatStore storageId=0x" + Integer.toHexString(storageId));
+        bg.execute(() -> {
+            PtpIpClient client = AppState.get().client;
+            if (client == null || !client.isConnected()) {
+                runOnUiThread(() -> Toast.makeText(this, "相机未连接，格式化未执行", Toast.LENGTH_LONG).show());
+                return;
+            }
+            int rc = client.formatStore(storageId);
+            if (rc == PtpIpClient.RC_OK) {
+                // 卡上对象已不存在：照片列表与已下载记录整体失效，一并清掉防同名误判
+                AppState.get().photos.clear();
+                DownloadRecord.clearAll(this);
+                runOnUiThread(() -> {
+                    rebuildDisplay();
+                    updateSelInfo();
+                    devStorageTv.setText("存储卡：已格式化（" + desc + "）");
+                    Toast.makeText(this, "格式化完成：相机返回 OK", Toast.LENGTH_LONG).show();
+                });
+                Diag.op("FORMAT", "格式化成功，本地照片列表与已下载记录已同步清除");
+            } else {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "格式化失败：相机返回 rc=0x" + Integer.toHexString(rc) + "（详见诊断页）", Toast.LENGTH_LONG).show());
+            }
+        });
     }
 
     private LinearLayout.LayoutParams matchWrap() {
@@ -464,11 +604,76 @@ public class MainActivity extends Activity {
 
     // ---------- 照片页 ----------
     private View buildPhotosPage() {
+        FrameLayout pageRoot = new FrameLayout(this);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
+        pageRoot.addView(col);
+
+        // 自动回传状态横幅（开启时在图库页顶部明示）
+        autoBannerTv = txt("", 13, Ui.ACCENT_TX, true);
+        autoBannerTv.setBackgroundColor(Ui.ACCENT);
+        autoBannerTv.setPadding(dp(10), dp(6), dp(10), dp(6));
+        autoBannerTv.setVisibility(View.GONE);
+        col.addView(autoBannerTv);
+
+        // —— 拍完自动回传卡 ——
+        LinearLayout autoCard = card();
+        LinearLayout autoHead = new LinearLayout(this);
+        autoHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView autoIc = new ImageView(this);
+        autoIc.setImageDrawable(icon(R.drawable.ic_auto, Ui.ACCENT));
+        autoHead.addView(autoIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView autoTitle = txt("拍完自动回传", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams atlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        atlp.setMargins(dp(8), 0, 0, 0);
+        autoHead.addView(autoTitle, atlp);
+        autoDlCheck = new CheckBox(this);
+        autoDlCheck.setText("开启");
+        autoDlCheck.setTextColor(Ui.TEXT);
+        autoDlCheck.setTextSize(13);
+        autoDlCheck.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        autoDlCheck.setChecked(prefs.getBoolean("auto_dl", false)); // 默认关，先回填再挂监听防误触发
+        autoHead.addView(autoDlCheck);
+        autoCard.addView(autoHead);
+        autoCard.addView(txt("连接期间相机拍的新照片（遥控拍摄或直接按相机快门都算）自动排队下载到相册；与已下载记录去重，不会重复传。默认关。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
+        LinearLayout autoModeRow = new LinearLayout(this);
+        autoModeRow.setGravity(Gravity.CENTER_VERTICAL);
+        autoModeRow.addView(txt("范围", 13, Ui.TEXT_DIM, false));
+        autoJpgBtn = txt("仅 JPG", 13, Ui.TEXT, true);
+        autoJpgBtn.setGravity(Gravity.CENTER);
+        autoJpgBtn.setPadding(dp(12), dp(7), dp(12), dp(7));
+        autoAllBtn = txt("JPG + RAW", 13, Ui.TEXT, true);
+        autoAllBtn.setGravity(Gravity.CENTER);
+        autoAllBtn.setPadding(dp(12), dp(7), dp(12), dp(7));
+        LinearLayout.LayoutParams amlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        amlp.setMargins(dp(10), 0, 0, 0);
+        autoModeRow.addView(autoJpgBtn, amlp);
+        LinearLayout.LayoutParams amlp2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        amlp2.setMargins(dp(8), 0, 0, 0);
+        autoModeRow.addView(autoAllBtn, amlp2);
+        autoCard.addView(autoModeRow, wrapMargin(8));
+        autoHintTv = txt("", 12, Ui.TEXT_DIM, false);
+        autoCard.addView(autoHintTv, wrapMargin(6));
+        col.addView(autoCard);
+        autoDlCheck.setOnCheckedChangeListener((b, checked) -> {
+            prefs.edit().putBoolean("auto_dl", checked).apply();
+            Diag.op("AUTO", "自动回传开关 → " + (checked ? "开" : "关（默认关，用户手动开启才生效）"));
+            applyAutoSettings();
+        });
+        autoJpgBtn.setOnClickListener(v -> {
+            prefs.edit().putInt("auto_dl_mode", 0).apply();
+            applyAutoSettings();
+        });
+        autoAllBtn.setOnClickListener(v -> {
+            prefs.edit().putInt("auto_dl_mode", 1).apply();
+            applyAutoSettings();
+        });
+
         LinearLayout topRow = new LinearLayout(this);
         topRow.setGravity(Gravity.CENTER_VERTICAL);
-        selInfoTv = txt("已选 0 张 · 0 B", 14, Ui.TEXT, true);
+        selInfoTv = txt("已选 0 个文件 · 0 B", 14, Ui.TEXT, true);
         topRow.addView(selInfoTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         Button allBtn = btn("全选", R.drawable.ic_check, false);
         Button noneBtn = btn("清空", R.drawable.ic_clear, false);
@@ -480,6 +685,35 @@ public class MainActivity extends Activity {
         allBtn.setOnClickListener(v -> { for (PhotoItem p : AppState.get().photos) p.selected = true; updateSelInfo(); adapter.notifyDataSetChanged(); });
         noneBtn.setOnClickListener(v -> { for (PhotoItem p : AppState.get().photos) p.selected = false; updateSelInfo(); adapter.notifyDataSetChanged(); });
         col.addView(topRow);
+
+        // —— 筛选条（全部/未下载/仅 JPG/仅 RAW/按日期） ——
+        LinearLayout filterRow = new LinearLayout(this);
+        filterRow.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView fIc = new ImageView(this);
+        fIc.setImageDrawable(icon(R.drawable.ic_filter, Ui.TEXT_DIM));
+        filterRow.addView(fIc, new LinearLayout.LayoutParams(dp(18), dp(18)));
+        android.widget.HorizontalScrollView fScroll = new android.widget.HorizontalScrollView(this);
+        fScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout chipsBox = new LinearLayout(this);
+        String[] chipNames = {"全部", "未下载", "仅 JPG", "仅 RAW", "日期"};
+        for (int i = 0; i < 5; i++) {
+            final int idx = i;
+            TextView chip = txt(chipNames[i], 13, Ui.TEXT, true);
+            chip.setGravity(Gravity.CENTER);
+            chip.setPadding(dp(12), dp(6), dp(12), dp(6));
+            chip.setOnClickListener(v -> onFilterChip(idx));
+            LinearLayout.LayoutParams chp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            chp.setMargins(dp(6), 0, 0, 0);
+            chipsBox.addView(chip, chp);
+            filterChips[i] = chip;
+        }
+        fScroll.addView(chipsBox);
+        LinearLayout.LayoutParams fslp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        fslp.setMargins(dp(4), 0, 0, 0);
+        filterRow.addView(fScroll, fslp);
+        col.addView(filterRow, wrapMargin(6));
+        refreshFilterChips();
 
         LinearLayout cacheRow = new LinearLayout(this);
         cacheRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -496,10 +730,10 @@ public class MainActivity extends Activity {
             thumbCache.diskEnabled = checked;
             Diag.op("THUMB", "磁盘缓存 " + (checked ? "开启" : "关闭"));
         });
-        LinearLayout.LayoutParams chlp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams chlp2 = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        chlp.setMargins(dp(6), 0, 0, 0);
-        cacheRow.addView(diskCacheCheck, chlp);
+        chlp2.setMargins(dp(6), 0, 0, 0);
+        cacheRow.addView(diskCacheCheck, chlp2);
         col.addView(cacheRow);
 
         grid = new GridView(this);
@@ -510,10 +744,21 @@ public class MainActivity extends Activity {
         adapter = new PhotoAdapter();
         grid.setAdapter(adapter);
         grid.setOnItemClickListener((parent, view, position, id) -> {
-            PhotoItem p = AppState.get().photos.get(position);
-            p.selected = !p.selected;
+            if (position < 0 || position >= displayRows.size()) return;
+            GalleryRow row = displayRows.get(position);
+            if (row.isPair()) { showPairChooser(row); return; }
+            row.a.selected = !row.a.selected;
             updateSelInfo();
             adapter.notifyDataSetChanged();
+        });
+        grid.setOnItemLongClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= displayRows.size()) return true;
+            GalleryRow row = displayRows.get(position);
+            boolean target = row.selectedCount() < row.files().size();
+            for (PhotoItem p : row.files()) p.selected = target;
+            updateSelInfo();
+            adapter.notifyDataSetChanged();
+            return true;
         });
         col.addView(grid, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
@@ -525,10 +770,314 @@ public class MainActivity extends Activity {
         dlBar.setProgressTintList(ColorStateList.valueOf(Ui.ACCENT));
         LinearLayout.LayoutParams blp = matchWrap(); blp.setMargins(0, dp(4), 0, dp(8));
         col.addView(dlBar, blp);
+        LinearLayout dlRow = new LinearLayout(this);
+        delBtn = btn("删除所选", R.drawable.ic_delete, false);
+        delBtn.setTextColor(Ui.ERR);
         dlBtn = btn("下载所选到相册", R.drawable.ic_download, true);
-        col.addView(dlBtn);
+        dlRow.addView(delBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout.LayoutParams drlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        drlp.setMargins(dp(8), 0, 0, 0);
+        dlRow.addView(dlBtn, drlp);
+        col.addView(dlRow);
         dlBtn.setOnClickListener(v -> onDownloadClicked());
-        return col;
+        delBtn.setOnClickListener(v -> onDeleteClicked());
+
+        // —— 通用列表弹层（配对选择 / 日期选择共用，自绘深色卡） ——
+        phOverlay = new FrameLayout(this);
+        phOverlay.setBackgroundColor(0xB3000000);
+        phOverlay.setVisibility(View.GONE);
+        LinearLayout ovCard = new LinearLayout(this);
+        ovCard.setOrientation(LinearLayout.VERTICAL);
+        ovCard.setBackground(getDrawable(R.drawable.bg_card));
+        ovCard.setPadding(dp(16), dp(14), dp(16), dp(14));
+        FrameLayout.LayoutParams ovlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        ovlp.setMargins(dp(22), 0, dp(22), 0);
+        phOvTitleTv = txt("选择", 16, Ui.TEXT, true);
+        ovCard.addView(phOvTitleTv);
+        ScrollView ovScroll = new ScrollView(this);
+        phOvList = new LinearLayout(this);
+        phOvList.setOrientation(LinearLayout.VERTICAL);
+        ovScroll.addView(phOvList);
+        ovScroll.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
+        ovCard.addView(ovScroll);
+        ovCard.setOnClickListener(v -> { /* 拦截冒泡 */ });
+        Button ovClose = btn("取消", 0, false);
+        ovClose.setOnClickListener(v -> phOverlay.setVisibility(View.GONE));
+        LinearLayout.LayoutParams ovclp = matchWrap(); ovclp.setMargins(0, dp(10), 0, 0);
+        ovCard.addView(ovClose, ovclp);
+        phOverlay.addView(ovCard, ovlp);
+        phOverlay.setOnClickListener(v -> phOverlay.setVisibility(View.GONE));
+        pageRoot.addView(phOverlay);
+        phConfirm = new ConfirmCard(this, pageRoot);
+
+        updateAutoUi();
+        return pageRoot;
+    }
+
+    // ---------- v0.3 自动回传 ----------
+
+    /** 远控中枢的自动回传接管方：在其 exec 线程被调用，只做去重判定 + 非阻塞入队 */
+    private final RemoteController.AutoTransferHandler autoTransferHandler = (handle, oi) -> {
+        if (DownloadRecord.isDownloaded(oi.filename)) {
+            Diag.op("AUTO", oi.filename + " 已在已下载记录中，自动回传跳过（去重）");
+            return true;
+        }
+        if (DownloadService.hasPending(oi.filename)) {
+            Diag.op("AUTO", oi.filename + " 已在下载队列中，自动回传跳过（去重）");
+            return true;
+        }
+        try {
+            DownloadService.enqueue(MainActivity.this,
+                    Collections.singletonList(new DownloadService.Job(handle, oi.filename, oi.size)));
+            Diag.op("AUTO", "自动回传入队：" + oi.filename + "（" + PhotoItem.fmtSize(oi.size) + "）");
+            runOnUiThread(() -> Toast.makeText(MainActivity.this, "自动回传：" + oi.filename, Toast.LENGTH_SHORT).show());
+        } catch (Exception e) {
+            // 后台拉起前台服务可能被系统限制：明确记诊断，不静默丢失
+            Diag.op("AUTO", "自动回传入队失败（可能被系统后台启动限制，保持 App 在前台可避免）：" + e.getMessage());
+        }
+        return true;
+    };
+
+    /** 把当前自动回传设置同步给遥控中枢 + 刷新横幅/按钮样式（连接装配、开关变更时调用） */
+    private void applyAutoSettings() {
+        boolean on = prefs.getBoolean("auto_dl", false);
+        boolean raw = prefs.getInt("auto_dl_mode", 0) == 1;
+        if (remote != null) remote.setAutoTransfer(on, raw, autoTransferHandler);
+        updateAutoUi();
+    }
+
+    private void styleAutoModeBtn(TextView t, boolean on) {
+        if (t == null) return;
+        t.setBackground(getDrawable(on ? R.drawable.bg_btn_primary : R.drawable.bg_btn_ghost));
+        t.setTextColor(on ? Ui.ACCENT_TX : Ui.TEXT);
+    }
+
+    private void updateAutoUi() {
+        if (autoBannerTv == null) return;
+        boolean on = prefs.getBoolean("auto_dl", false);
+        boolean raw = prefs.getInt("auto_dl_mode", 0) == 1;
+        styleAutoModeBtn(autoJpgBtn, !raw);
+        styleAutoModeBtn(autoAllBtn, raw);
+        autoBannerTv.setVisibility(on ? View.VISIBLE : View.GONE);
+        if (on) autoBannerTv.setText("自动回传已开启：新照片拍完自动下载到相册（范围：" + (raw ? "JPG + RAW" : "仅 JPG") + "）");
+        PtpIpClient c = AppState.get().client;
+        if (c == null || !c.isConnected()) {
+            autoHintTv.setText("连接相机后生效：靠相机的新照片事件触发回传。");
+        } else if (!c.isEventChannelOk()) {
+            autoHintTv.setText("注意：当前连接没有事件通道（含 WU 适配器/部分 Coolpix 机型，或连接时事件通道建立失败），相机不会推送新照片事件，自动回传不会触发；手动下载不受影响。");
+        } else {
+            autoHintTv.setText("事件通道正常，自动回传待命中（拍一张试试）。");
+        }
+    }
+
+    // ---------- v0.3 筛选与配对 ----------
+
+    private boolean photoVisible(PhotoItem p) {
+        switch (filterMode) {
+            case FILTER_NOT_DL: return !p.downloaded;
+            case FILTER_JPG: return p.kind() == PhotoItem.Kind.JPG;
+            case FILTER_RAW: return p.kind() == PhotoItem.Kind.NEF;
+            case FILTER_DATE: return filterDate != null && filterDate.equals(p.dateKey());
+            default: return true;
+        }
+    }
+
+    /** 按当前筛选重建展示行：同基名 NEF+JPG 折叠成一条配对行（双成员都可见才成对） */
+    private void rebuildDisplay() {
+        displayRows.clear();
+        java.util.Map<String, GalleryRow> pairMap = new java.util.HashMap<>();
+        for (PhotoItem p : AppState.get().photos) {
+            if (!photoVisible(p)) continue;
+            PhotoItem.Kind k = p.kind();
+            if (k == PhotoItem.Kind.JPG || k == PhotoItem.Kind.NEF) {
+                GalleryRow r = pairMap.get(p.baseName());
+                if (r == null) {
+                    r = new GalleryRow(p);
+                    pairMap.put(p.baseName(), r);
+                    displayRows.add(r);
+                } else if (r.b == null && r.a.kind() != k) {
+                    r.b = p; // 配对完成
+                } else {
+                    displayRows.add(new GalleryRow(p)); // 同基名同格式重复（罕见）独立成行
+                }
+            } else {
+                displayRows.add(new GalleryRow(p));
+            }
+        }
+        if (adapter != null) adapter.notifyDataSetChanged();
+    }
+
+    private void refreshFilterChips() {
+        for (int i = 0; i < filterChips.length; i++) {
+            if (filterChips[i] == null) continue;
+            boolean sel = filterMode == i;
+            filterChips[i].setBackground(getDrawable(sel ? R.drawable.bg_btn_primary : R.drawable.bg_btn_ghost));
+            filterChips[i].setTextColor(sel ? Ui.ACCENT_TX : Ui.TEXT);
+        }
+        if (filterChips[FILTER_DATE] != null) {
+            filterChips[FILTER_DATE].setText(filterMode == FILTER_DATE
+                    ? "日期：" + fmtDateLabel(filterDate) : "日期");
+        }
+    }
+
+    private static String fmtDateLabel(String yyyymmdd) {
+        if (yyyymmdd == null || yyyymmdd.length() < 8) return "未知日期";
+        return yyyymmdd.substring(0, 4) + "-" + yyyymmdd.substring(4, 6) + "-" + yyyymmdd.substring(6, 8);
+    }
+
+    private void onFilterChip(int idx) {
+        if (idx == FILTER_DATE) { showDateChooser(); return; }
+        filterMode = idx;
+        Diag.op("FILTER", "筛选 → " + new String[]{"全部", "未下载", "仅 JPG", "仅 RAW", "按日期"}[idx]);
+        refreshFilterChips();
+        rebuildDisplay();
+        updateSelInfo();
+    }
+
+    private void phOverlayShow(String title) {
+        phOvTitleTv.setText(title);
+        phOvList.removeAllViews();
+        phOverlay.setVisibility(View.VISIBLE);
+    }
+
+    private void phOverlayAddNote(String text) {
+        phOvList.addView(txt(text, 12, Ui.TEXT_DIM, false), wrapMargin(6));
+    }
+
+    private void phOverlayAddBtn(String label, boolean primary, final Runnable r) {
+        Button b = btn(label, 0, primary);
+        b.setOnClickListener(v -> { phOverlay.setVisibility(View.GONE); r.run(); });
+        LinearLayout.LayoutParams lp = matchWrap(); lp.setMargins(0, dp(6), 0, 0);
+        phOvList.addView(b, lp);
+    }
+
+    /** 配对行点击：让用户分别选两个文件下哪个（计数按文件数） */
+    private void showPairChooser(final GalleryRow row) {
+        PhotoItem jpg = null, nef = null;
+        for (PhotoItem p : row.files()) {
+            if (p.kind() == PhotoItem.Kind.JPG) jpg = p;
+            if (p.kind() == PhotoItem.Kind.NEF) nef = p;
+        }
+        final PhotoItem fJpg = jpg, fNef = nef;
+        boolean both = jpg != null && nef != null && jpg.selected && nef.selected;
+        boolean jpgOnly = jpg != null && jpg.selected && (nef == null || !nef.selected);
+        boolean nefOnly = nef != null && nef.selected && (jpg == null || !jpg.selected);
+        phOverlayShow(row.a.baseName() + "（RAW + JPG 配对）");
+        phOverlayAddNote("同一次拍摄的两个文件，分别勾选要下载哪个（已选计数按文件数算）。两个都已有「已下载」标记的不会重复下载。");
+        phOverlayAddBtn("两个都选（JPG " + PhotoItem.fmtSize(jpg != null ? jpg.size() : 0)
+                + " + NEF " + PhotoItem.fmtSize(nef != null ? nef.size() : 0) + "）", both,
+                () -> applyPairSelection(row, true, true));
+        phOverlayAddBtn("只选 JPG（" + PhotoItem.fmtSize(jpg != null ? jpg.size() : 0) + "）", jpgOnly && !both,
+                () -> applyPairSelection(row, true, false));
+        phOverlayAddBtn("只选 NEF（" + PhotoItem.fmtSize(nef != null ? nef.size() : 0) + "）", nefOnly && !both,
+                () -> applyPairSelection(row, false, true));
+        phOverlayAddBtn("两个都不选", !both && !jpgOnly && !nefOnly,
+                () -> applyPairSelection(row, false, false));
+    }
+
+    private void applyPairSelection(GalleryRow row, boolean jpgSel, boolean nefSel) {
+        for (PhotoItem p : row.files()) {
+            if (p.kind() == PhotoItem.Kind.JPG) p.selected = jpgSel;
+            else if (p.kind() == PhotoItem.Kind.NEF) p.selected = nefSel;
+        }
+        updateSelInfo();
+        adapter.notifyDataSetChanged();
+    }
+
+    /** 日期筛选弹层：只列照片里实际存在的日期（自绘深色卡列表，禁系统日期弹窗） */
+    private void showDateChooser() {
+        phOverlayShow("按日期筛选");
+        if (AppState.get().photos.isEmpty()) {
+            phOverlayAddNote("还没有照片列表，先点「读取照片」。");
+            return;
+        }
+        phOverlayAddBtn("全部日期（不限）", filterMode != FILTER_DATE, () -> {
+            filterMode = FILTER_ALL;
+            refreshFilterChips(); rebuildDisplay(); updateSelInfo();
+        });
+        java.util.TreeMap<String, Integer> counts = new java.util.TreeMap<>(Collections.reverseOrder());
+        for (PhotoItem p : AppState.get().photos) {
+            String k = p.dateKey();
+            counts.put(k, counts.getOrDefault(k, 0) + 1);
+        }
+        for (final java.util.Map.Entry<String, Integer> e : counts.entrySet()) {
+            final String key = e.getKey();
+            String label = (key.isEmpty() ? "未知日期" : fmtDateLabel(key)) + " · " + e.getValue() + " 张";
+            phOverlayAddBtn(label, filterMode == FILTER_DATE && key.equals(filterDate), () -> {
+                filterMode = FILTER_DATE;
+                filterDate = key;
+                Diag.op("FILTER", "按日期筛选 → " + (key.isEmpty() ? "未知日期" : key));
+                refreshFilterChips(); rebuildDisplay(); updateSelInfo();
+            });
+        }
+    }
+
+    // ---------- v0.3 删除照片 ----------
+
+    private List<PhotoItem> selectedFiles() {
+        List<PhotoItem> r = new ArrayList<>();
+        for (PhotoItem p : AppState.get().photos) if (p.selected) r.add(p);
+        return r;
+    }
+
+    private void onDeleteClicked() {
+        final List<PhotoItem> targets = selectedFiles();
+        if (targets.isEmpty()) {
+            Toast.makeText(this, "先勾选要删除的照片（配对照片点开可选删哪个）", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!AppState.get().sessionReady()) {
+            Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        StringBuilder body = new StringBuilder();
+        body.append("将删除相机存储卡上的 ").append(targets.size()).append(" 个原文件：\n");
+        int show = Math.min(6, targets.size());
+        for (int i = 0; i < show; i++) {
+            body.append("· ").append(targets.get(i).filename())
+                    .append("（").append(PhotoItem.fmtSize(targets.get(i).size())).append("）\n");
+        }
+        if (targets.size() > show) body.append("· ……等共 ").append(targets.size()).append(" 个\n");
+        body.append("\n删的是相机卡上的原文件，删除后不可恢复！已下载到手机相册的副本不受影响。");
+        phConfirm.show("删除相机照片？", body.toString(), "删除 " + targets.size() + " 个", true,
+                () -> doDelete(targets));
+    }
+
+    /** 逐张 DeleteObject：成功从列表与已下载记录移除；失败逐张记诊断并在结果里点名 */
+    private void doDelete(final List<PhotoItem> targets) {
+        Diag.op("DELETE", "批量删除开始：" + targets.size() + " 个文件");
+        bg.execute(() -> {
+            PtpIpClient client = AppState.get().client;
+            if (client == null || !client.isConnected()) {
+                runOnUiThread(() -> Toast.makeText(this, "相机未连接，删除未执行", Toast.LENGTH_LONG).show());
+                return;
+            }
+            int ok = 0;
+            List<String> fails = new ArrayList<>();
+            for (PhotoItem p : targets) {
+                int rc = client.deleteObject(p.handle, p.info != null ? p.info.format : 0);
+                if (rc == PtpIpClient.RC_OK) {
+                    ok++;
+                    AppState.get().photos.remove(p);
+                    DownloadRecord.remove(p.filename());
+                    Diag.op("DELETE", "已删除 " + p.filename());
+                } else {
+                    fails.add(p.filename() + "（rc=0x" + Integer.toHexString(rc) + "）");
+                    Diag.op("DELETE", "删除失败 " + p.filename() + " rc=0x" + Integer.toHexString(rc));
+                }
+            }
+            final int okF = ok;
+            final List<String> failsF = fails;
+            runOnUiThread(() -> {
+                rebuildDisplay();
+                updateSelInfo();
+                String msg = "删除完成：成功 " + okF + (failsF.isEmpty() ? " 个" : "，失败 " + failsF.size() + " 个（" + failsF.get(0) + (failsF.size() > 1 ? " 等，详见诊断" : "") + "）");
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+            });
+            Diag.op("DELETE", "批量删除结束：成功 " + ok + "，失败 " + fails.size());
+        });
     }
 
     // ---------- 诊断页 ----------
@@ -551,7 +1100,7 @@ public class MainActivity extends Activity {
         clearBtn.setOnClickListener(v -> { Diag.clear(); refreshDiag(); });
         // v0.2 实验开关：非 Z 系机型（profile=BASIC）默认锁定未验证的遥控功能，用户在此手动放行尝试
         expCheck = new CheckBox(this);
-        expCheck.setText("实验：为非 Z 系机型开启全部遥控功能（LiveView/对焦/录像/参数调节，未验证）");
+        expCheck.setText("实验：为非 Z 系机型开启全部遥控功能（LiveView/对焦/录像/参数调节，未验证）；同时显示连接页「格式化存储卡」高危入口");
         expCheck.setTextColor(Ui.TEXT);
         expCheck.setTextSize(13);
         expCheck.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
@@ -560,6 +1109,7 @@ public class MainActivity extends Activity {
             prefs.edit().putBoolean("remote_exp", checked).apply();
             if (remote != null) remote.setExperimental(checked);
             else Diag.op("REMOTE", "实验开关 → " + checked + "（连接相机后生效）");
+            updateFormatVisibility();
         });
         col.addView(expCheck, wrapMargin(8));
         diagScroll = new ScrollView(this);
@@ -742,6 +1292,48 @@ public class MainActivity extends Activity {
         captureBtn.setOnClickListener(v -> { if (remote != null) remote.capture(); });
         movieBtn.setOnClickListener(v -> { if (remote != null) remote.toggleMovie(); });
         col.addView(shotCard);
+
+        // —— 间隔拍摄（v0.3） ——
+        LinearLayout ivCard = card();
+        LinearLayout ivHead = new LinearLayout(this);
+        ivHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView ivIc = new ImageView(this);
+        ivIc.setImageDrawable(icon(R.drawable.ic_timer, Ui.ACCENT));
+        ivHead.addView(ivIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView ivTitle = txt("间隔拍摄", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams ivtlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ivtlp.setMargins(dp(8), 0, 0, 0);
+        ivHead.addView(ivTitle, ivtlp);
+        ivCard.addView(ivHead);
+        ivCard.addView(txt("按固定间隔自动遥控拍摄（前台服务保活，锁屏也能继续）。与照片页「拍完自动回传」同开可拍一张传一张。任一张拍摄失败会立刻报错并停下，不静默重试。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
+        LinearLayout ivInputRow = new LinearLayout(this);
+        ivInputRow.setGravity(Gravity.CENTER_VERTICAL);
+        ivInputRow.addView(txt("间隔（秒）", 13, Ui.TEXT_DIM, false));
+        ivSecEt = input("5", false);
+        ivSecEt.setInputType(InputType.TYPE_CLASS_NUMBER);
+        ivSecEt.setText("5");
+        LinearLayout.LayoutParams islp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        islp.setMargins(dp(8), 0, 0, 0);
+        ivInputRow.addView(ivSecEt, islp);
+        TextView ivCntLbl = txt("张数（0=无限）", 13, Ui.TEXT_DIM, false);
+        LinearLayout.LayoutParams icllp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        icllp.setMargins(dp(12), 0, 0, 0);
+        ivInputRow.addView(ivCntLbl, icllp);
+        ivCountEt = input("10", false);
+        ivCountEt.setInputType(InputType.TYPE_CLASS_NUMBER);
+        ivCountEt.setText("10");
+        LinearLayout.LayoutParams iclp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        iclp.setMargins(dp(8), 0, 0, 0);
+        ivInputRow.addView(ivCountEt, iclp);
+        ivCard.addView(ivInputRow, wrapMargin(8));
+        ivBtn = btn("开始间隔拍摄", R.drawable.ic_timer, true);
+        ivBtn.setOnClickListener(v -> onIntervalToggle());
+        ivCard.addView(ivBtn, wrapMargin(8));
+        ivStatusTv = txt("未开始", 12, Ui.TEXT_DIM, false);
+        ivCard.addView(ivStatusTv, wrapMargin(6));
+        col.addView(ivCard);
 
         // —— 参数调节 ——
         LinearLayout adjCard = card();
@@ -993,6 +1585,34 @@ public class MainActivity extends Activity {
         }
     };
 
+    /** 间隔拍摄开关：运行中→请求停止；未运行→校验参数与门控后启动前台服务 */
+    private void onIntervalToggle() {
+        if (IntervalService.isRunning()) {
+            IntervalService.requestStop();
+            ivStatusTv.setText("正在停止间隔拍摄…");
+            return;
+        }
+        if (!AppState.get().sessionReady()) {
+            Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (remote != null && !remote.featureAllowed(RemoteController.F_CAPTURE)) {
+            Toast.makeText(this, "当前机型遥控快门未解锁或已降级，间隔拍摄不可用（见诊断页）", Toast.LENGTH_LONG).show();
+            return;
+        }
+        int sec = 5, cnt = 10;
+        try { sec = Integer.parseInt(ivSecEt.getText().toString().trim()); } catch (Exception ignore) {}
+        try { cnt = Integer.parseInt(ivCountEt.getText().toString().trim()); } catch (Exception ignore) {}
+        if (sec < 1) sec = 1;
+        if (cnt < 0) cnt = 0;
+        ivSecEt.setText(String.valueOf(sec));
+        ivCountEt.setText(String.valueOf(cnt));
+        Diag.op("INTERVAL", "用户启动间隔拍摄：间隔 " + sec + "s，张数 " + (cnt > 0 ? cnt : "无限"));
+        IntervalService.start(this, sec, cnt);
+        ivBtn.setText("停止间隔拍摄");
+        ivStatusTv.setText("间隔拍摄启动中…");
+    }
+
     /** 断开/换连时拆遥控中枢（停取景与录像，摘事件监听）；图传主链路不受影响 */
     private void teardownRemote() {
         if (remote != null) {
@@ -1143,6 +1763,7 @@ public class MainActivity extends Activity {
                 remote.setStorageId(st.storageId);
                 remote.queryLvSize();
                 remote.loadProps(st.storageId);
+                applyAutoSettings(); // 把自动回传设置（开关/范围）同步给新装配的中枢 + 刷新横幅
                 runOnUiThread(() -> {
                     rcStatusTv.setText("已连接 · " + model + "（遥控功能待真机逐项验证）");
                     refreshRemoteEnabled();
@@ -1178,8 +1799,9 @@ public class MainActivity extends Activity {
                 devBatteryTv.setText("电量：—");
                 devStorageTv.setText("存储卡：—");
                 profileTv.setText("");
-                adapter.notifyDataSetChanged();
+                rebuildDisplay();
                 updateSelInfo();
+                updateAutoUi();
             });
         });
     }
@@ -1207,10 +1829,16 @@ public class MainActivity extends Activity {
                     if (++done % 100 == 0) Diag.op("PTP", "ObjectInfo 进度 " + done + "/" + handles.length);
                 }
                 Collections.sort(list, (a, b) -> b.sortKey().compareTo(a.sortKey())); // 新→旧
+                int dlCount = 0;
+                for (PhotoItem p : list) {
+                    p.downloaded = DownloadRecord.isDownloaded(p.filename());
+                    if (p.downloaded) dlCount++;
+                }
                 st.photos.clear();
                 st.photos.addAll(list);
-                Diag.op("PTP", "照片列表就绪：" + list.size() + " 张");
-                runOnUiThread(() -> { adapter.notifyDataSetChanged(); updateSelInfo(); });
+                Diag.op("PTP", "照片列表就绪：" + list.size() + " 张（其中已下载 " + dlCount + " 张，据已下载记录 "
+                        + DownloadRecord.count() + " 条比对）");
+                runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); updateAutoUi(); });
             } catch (Exception e) {
                 Diag.op("PTP", "读取照片失败：" + e.getMessage());
                 runOnUiThread(() -> Toast.makeText(this, "读取失败：" + e.getMessage(), Toast.LENGTH_SHORT).show());
@@ -1221,8 +1849,11 @@ public class MainActivity extends Activity {
     private void updateSelInfo() {
         int n = 0; long bytes = 0;
         for (PhotoItem p : AppState.get().photos) if (p.selected) { n++; bytes += p.size(); }
-        selInfoTv.setText("已选 " + n + " 张 · " + PhotoItem.fmtSize(bytes)
-                + "（共 " + AppState.get().photos.size() + " 张）");
+        String s = "已选 " + n + " 个文件 · " + PhotoItem.fmtSize(bytes)
+                + "（共 " + AppState.get().photos.size() + " 张）";
+        if (filterMode != FILTER_ALL) s += "｜显示 " + displayRows.size() + " 条";
+        selInfoTv.setText(s);
+        if (delBtn != null) delBtn.setText(n > 0 ? "删除所选（" + n + "）" : "删除所选");
     }
 
     private void markDownloaded(String filename, boolean ok) {
@@ -1230,14 +1861,14 @@ public class MainActivity extends Activity {
         for (PhotoItem p : AppState.get().photos) {
             if (p.filename().equals(filename)) { p.downloaded = true; p.selected = false; }
         }
-        adapter.notifyDataSetChanged();
+        rebuildDisplay(); // 「未下载」筛选下刚下完的应即时消失，故走重建而非普通刷新
         updateSelInfo();
     }
 
     private void onDownloadClicked() {
         List<DownloadService.Job> jobs = new ArrayList<>();
-        for (PhotoItem p : AppState.get().photos) {
-            if (p.selected) jobs.add(new DownloadService.Job(p.handle, p.filename(), p.size()));
+        for (PhotoItem p : selectedFiles()) {
+            jobs.add(new DownloadService.Job(p.handle, p.filename(), p.size()));
         }
         if (jobs.isEmpty()) { Toast.makeText(this, "先勾选要下载的照片", Toast.LENGTH_SHORT).show(); return; }
         if (Build.VERSION.SDK_INT <= 28
@@ -1250,18 +1881,19 @@ public class MainActivity extends Activity {
         Toast.makeText(this, "开始下载 " + jobs.size() + " 张（见通知栏进度）", Toast.LENGTH_SHORT).show();
     }
 
-    // ================= 照片墙 Adapter =================
+    // ================= 照片墙 Adapter（数据源为 displayRows：含 RAW+JPG 配对折叠行） =================
 
     private class PhotoAdapter extends BaseAdapter {
-        @Override public int getCount() { return AppState.get().photos.size(); }
-        @Override public Object getItem(int pos) { return AppState.get().photos.get(pos); }
-        @Override public long getItemId(int pos) { return AppState.get().photos.get(pos).handle; }
+        @Override public int getCount() { return displayRows.size(); }
+        @Override public Object getItem(int pos) { return displayRows.get(pos); }
+        @Override public long getItemId(int pos) { return displayRows.get(pos).a.handle; }
 
         @Override public View getView(int pos, View convertView, ViewGroup parent) {
-            final PhotoItem item = AppState.get().photos.get(pos);
+            final GalleryRow row = displayRows.get(pos);
+            final PhotoItem thumbItem = row.jpgMember(); // 配对行缩略图取 JPG 成员
             FrameLayout cell;
-            ImageView thumbIv, checkIv, badgeIv;
-            TextView nameTv;
+            ImageView thumbIv, checkIv, badgeIv, badge2Iv;
+            TextView nameTv, chipTv, selTv;
             View selFrame;
             if (convertView == null) {
                 cell = new FrameLayout(MainActivity.this);
@@ -1286,12 +1918,28 @@ public class MainActivity extends Activity {
                 FrameLayout.LayoutParams chlp = new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP | Gravity.END);
                 chlp.setMargins(0, dp(4), dp(4), 0);
                 cell.addView(checkIv, chlp);
+                // 已下载状态角标（左上）：已下载=绿 / 未下载=灰 / 配对部分已传=黄
+                chipTv = new TextView(MainActivity.this);
+                chipTv.setId(6);
+                chipTv.setTextSize(9);
+                chipTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+                chipTv.setBackground(getDrawable(R.drawable.bg_chip));
+                chipTv.setPadding(dp(5), dp(2), dp(5), dp(2));
+                FrameLayout.LayoutParams chiplp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START);
+                chiplp.setMargins(dp(4), dp(4), 0, 0);
+                cell.addView(chipTv, chiplp);
                 LinearLayout bottom = new LinearLayout(MainActivity.this);
                 bottom.setGravity(Gravity.CENTER_VERTICAL);
                 bottom.setBackgroundColor(0xB3000000);
                 badgeIv = new ImageView(MainActivity.this);
                 badgeIv.setId(3);
                 bottom.addView(badgeIv, new LinearLayout.LayoutParams(dp(15), dp(15)));
+                badge2Iv = new ImageView(MainActivity.this);
+                badge2Iv.setId(7);
+                LinearLayout.LayoutParams b2lp = new LinearLayout.LayoutParams(dp(15), dp(15));
+                b2lp.setMargins(dp(3), 0, 0, 0);
+                bottom.addView(badge2Iv, b2lp);
                 nameTv = new TextView(MainActivity.this);
                 nameTv.setId(5);
                 nameTv.setTextSize(9);
@@ -1299,9 +1947,18 @@ public class MainActivity extends Activity {
                 nameTv.setSingleLine(true);
                 nameTv.setEllipsize(android.text.TextUtils.TruncateAt.END);
                 LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
                 nlp.setMargins(dp(4), 0, 0, 0);
                 bottom.addView(nameTv, nlp);
+                selTv = new TextView(MainActivity.this);
+                selTv.setId(8);
+                selTv.setTextSize(9);
+                selTv.setTextColor(Ui.ACCENT);
+                selTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+                LinearLayout.LayoutParams slp2 = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                slp2.setMargins(dp(4), 0, dp(2), 0);
+                bottom.addView(selTv, slp2);
                 FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, dp(20), Gravity.BOTTOM);
                 cell.addView(bottom, blp);
@@ -1312,29 +1969,41 @@ public class MainActivity extends Activity {
                 badgeIv = cell.findViewById(3);
                 selFrame = cell.findViewById(4);
                 nameTv = cell.findViewById(5);
+                chipTv = cell.findViewById(6);
+                badge2Iv = cell.findViewById(7);
+                selTv = cell.findViewById(8);
             }
-            checkIv.setVisibility(item.selected ? View.VISIBLE : View.GONE);
-            selFrame.setVisibility(item.selected ? View.VISIBLE : View.GONE);
-            nameTv.setText(item.filename() + (item.downloaded ? "（已传）" : ""));
-            int badgeRes, badgeTint;
-            switch (item.kind()) {
-                case NEF: badgeRes = R.drawable.ic_badge_nef; badgeTint = Ui.BADGE_NEF; break;
-                case MP4: badgeRes = R.drawable.ic_badge_video; badgeTint = Ui.BADGE_MP4; break;
-                default: badgeRes = R.drawable.ic_badge_image; badgeTint = Ui.BADGE_JPG; break;
+            int selCount = row.selectedCount();
+            checkIv.setVisibility(selCount > 0 ? View.VISIBLE : View.GONE);
+            selFrame.setVisibility(selCount > 0 ? View.VISIBLE : View.GONE);
+            selTv.setVisibility(row.isPair() && selCount > 0 ? View.VISIBLE : View.GONE);
+            if (row.isPair()) selTv.setText("已选 " + selCount + "/2");
+            // 状态角标
+            int dlCount = row.downloadedCount();
+            int fileCount = row.files().size();
+            if (dlCount == fileCount) { chipTv.setText("已下载"); chipTv.setTextColor(Ui.OK); }
+            else if (dlCount == 0) { chipTv.setText("未下载"); chipTv.setTextColor(Ui.TEXT_DIM); }
+            else { chipTv.setText("部分已传"); chipTv.setTextColor(Ui.ACCENT); }
+            nameTv.setText(row.isPair() ? row.a.baseName() + " · JPG+NEF" : row.a.filename());
+            // 格式徽标：单行一个；配对行双徽标（JPG 黄 + NEF 紫）
+            setBadge(badgeIv, row.a.kind());
+            if (row.isPair()) {
+                badge2Iv.setVisibility(View.VISIBLE);
+                setBadge(badge2Iv, row.b.kind());
+            } else {
+                badge2Iv.setVisibility(View.GONE);
             }
-            Drawable bd = icon(badgeRes, badgeTint);
-            badgeIv.setImageDrawable(bd);
             // 缩略图：缓存命中直接用；未命中先放矢量占位（格式徽标放大），异步加载回来再换
-            Bitmap bmp = thumbCache.getMem(item.handle);
-            thumbIv.setTag(item.handle);
+            Bitmap bmp = thumbCache.getMem(thumbItem.handle);
+            thumbIv.setTag(thumbItem.handle);
             if (bmp != null) {
                 thumbIv.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 thumbIv.setImageBitmap(bmp);
             } else {
                 thumbIv.setScaleType(ImageView.ScaleType.CENTER);
-                thumbIv.setImageDrawable(icon(badgeRes, Ui.TEXT_DIM));
+                thumbIv.setImageDrawable(icon(badgeResOf(thumbItem.kind()), Ui.TEXT_DIM));
                 final ImageView target = thumbIv;
-                thumbCache.load(AppState.get().client, item.handle, AppState.get().profile,
+                thumbCache.load(AppState.get().client, thumbItem.handle, AppState.get().profile,
                         (handle, bitmap) -> runOnUiThread(() -> {
                             Object tag = target.getTag();
                             if (tag instanceof Integer && (Integer) tag == handle) {
@@ -1344,6 +2013,24 @@ public class MainActivity extends Activity {
                         }));
             }
             return cell;
+        }
+
+        private int badgeResOf(PhotoItem.Kind k) {
+            switch (k) {
+                case NEF: return R.drawable.ic_badge_nef;
+                case MP4: return R.drawable.ic_badge_video;
+                default: return R.drawable.ic_badge_image;
+            }
+        }
+
+        private void setBadge(ImageView iv, PhotoItem.Kind k) {
+            int tint;
+            switch (k) {
+                case NEF: tint = Ui.BADGE_NEF; break;
+                case MP4: tint = Ui.BADGE_MP4; break;
+                default: tint = Ui.BADGE_JPG; break;
+            }
+            iv.setImageDrawable(icon(badgeResOf(k), tint));
         }
     }
 }

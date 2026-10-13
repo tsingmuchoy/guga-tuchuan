@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 删除：垃圾桶（盖+把手 / 桶身两个实心剪影） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M9.5,2.8 L14.5,2.8 L14.5,4.8 L20,4.8 L20,6.8 L4,6.8 L4,4.8 L9.5,4.8 Z"/>
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M6.2,8.4 L17.8,8.4 L17,20.4 Q16.9,21.4 15.9,21.4 L8.1,21.4 Q7.1,21.4 7,20.4 Z"/>
+</vector>

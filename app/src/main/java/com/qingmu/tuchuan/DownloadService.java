@@ -53,6 +53,7 @@ public class DownloadService extends Service {
     }
 
     private static final List<Job> QUEUE = new ArrayList<>();
+    private static final Set<String> PENDING = new HashSet<>();
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
     public static volatile Listener listener;
     private static final String CHANNEL = "guga_dl";
@@ -60,9 +61,15 @@ public class DownloadService extends Service {
 
     public static void enqueue(Context ctx, List<Job> jobs) {
         synchronized (QUEUE) { QUEUE.addAll(jobs); }
+        synchronized (PENDING) { for (Job j : jobs) PENDING.add(j.filename); }
         Intent i = new Intent(ctx, DownloadService.class);
         if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i); else ctx.startService(i);
         Diag.op("DL", "入队 " + jobs.size() + " 个文件，队列共 " + QUEUE.size());
+    }
+
+    /** 该文件名是否已在下载队列/正在下载（v0.3 自动回传去重用） */
+    public static boolean hasPending(String filename) {
+        synchronized (PENDING) { return filename != null && PENDING.contains(filename); }
     }
 
     public static boolean isRunning() { return RUNNING.get(); }
@@ -131,6 +138,7 @@ public class DownloadService extends Service {
                     if (wl != null && wl.isHeld()) wl.release();
                 }
                 if (l != null) l.onJobDone(job, err == null, err);
+                synchronized (PENDING) { PENDING.remove(job.filename); }
             }
         } finally {
             RUNNING.set(false);
@@ -224,6 +232,8 @@ public class DownloadService extends Service {
         fin.delete();
         done.add(job.filename);
         prefs.edit().putStringSet("done_files", done).apply();
+        // v0.3：同步登记到已下载记录（图库角标/未下载筛选/自动回传去重的统一数据源）
+        DownloadRecord.add(getApplicationContext(), job.filename, job.handle, job.size);
         Diag.op("DL", "完成并已存入相册 Pictures/QingmuTuchuan/" + job.filename);
     }
 

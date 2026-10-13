@@ -111,6 +111,28 @@ public class RemoteController {
     private long lastPropRefreshMs = 0;
     private volatile int storageId = 0;
 
+    // ---- v0.3 拍完自动回传（事件驱动） ----
+    /**
+     * 自动回传候选回调（在 exec 线程调用，只许做入队这类非阻塞动作）：
+     * 返回 true=已接管（已入队下载或已确认下载过）；false=本次跳过。
+     */
+    public interface AutoTransferHandler { boolean onAutoCandidate(int handle, PtpIpClient.ObjectInfo oi); }
+    private volatile boolean autoTransferEnabled = false;
+    private volatile boolean autoIncludeRaw = false;
+    private volatile AutoTransferHandler autoHandler;
+    private final Set<Integer> autoSeen = ConcurrentHashMap.newKeySet();
+
+    /** 开/关自动回传（includeRaw=false 只传 JPG；true 连 NEF 一起传；MP4 两种模式都不自动传） */
+    public void setAutoTransfer(boolean enabled, boolean includeRaw, AutoTransferHandler h) {
+        autoTransferEnabled = enabled;
+        autoIncludeRaw = includeRaw;
+        autoHandler = h;
+        Diag.op("REMOTE", "自动回传 → " + (enabled ? "开" : "关")
+                + (enabled ? "（范围：" + (includeRaw ? "JPG+RAW" : "仅 JPG") + "，监听 ObjectAdded）" : ""));
+    }
+
+    public boolean isAutoTransferOn() { return autoTransferEnabled; }
+
     public void setStorageId(int storageId) { this.storageId = storageId; }
 
     public RemoteController(PtpIpClient client, CameraProfile profile, boolean experimental, Ui ui) {
@@ -679,6 +701,8 @@ public class RemoteController {
             exec.execute(() -> {
                 try {
                     PtpIpClient.ObjectInfo oi = client.getObjectInfo(handle);
+                    // v0.3 自动回传：先于预览图判定入队（下载队列与预览各走各的通道，互不阻塞）
+                    maybeAutoTransfer(handle, oi);
                     byte[] thumb = client.getThumb(handle);
                     Bitmap bmp = thumb != null && thumb.length > 0
                             ? BitmapFactory.decodeByteArray(thumb, 0, thumb.length) : null;
@@ -698,6 +722,29 @@ public class RemoteController {
                 loadProps(storageId);
             }
         }
+    }
+
+    /**
+     * 自动回传判定：开关开 + 格式在所选范围内（JPG，或 JPG+NEF）+ 本会话该 handle 没处理过，
+     * 才交给处理方（MainActivity 查已下载记录/队列去重后入队 DownloadService）。
+     * autoSeen 只防同一事件在本会话内重复触发；跨会话去重靠已下载记录（文件名）。
+     */
+    private void maybeAutoTransfer(int handle, PtpIpClient.ObjectInfo oi) {
+        if (!autoTransferEnabled) return;
+        AutoTransferHandler h = autoHandler;
+        if (h == null || oi == null) return;
+        PhotoItem.Kind k = PhotoItem.kindOf(oi.filename);
+        boolean want = k == PhotoItem.Kind.JPG || (autoIncludeRaw && k == PhotoItem.Kind.NEF);
+        if (!want) {
+            Diag.op("REMOTE", "自动回传跳过 " + oi.filename + "（格式 " + k + " 不在所选范围）");
+            return;
+        }
+        if (!autoSeen.add(handle)) {
+            Diag.op("REMOTE", "自动回传去重：handle=0x" + Integer.toHexString(handle) + " 本会话已处理");
+            return;
+        }
+        boolean handled = h.onAutoCandidate(handle, oi);
+        Diag.op("REMOTE", "自动回传 " + oi.filename + " → " + (handled ? "已接管（入队或已下载）" : "处理方跳过"));
     }
 
     public void shutdown() {

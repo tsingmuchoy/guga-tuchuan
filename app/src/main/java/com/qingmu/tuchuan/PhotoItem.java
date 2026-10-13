@@ -18,12 +18,30 @@ public class PhotoItem {
     public enum Kind { JPG, NEF, MP4, OTHER }
 
     /** 格式徽标分类：以文件名扩展名为准（PTP format code 对 NEF 各机不一致，扩展名最可靠） */
-    public Kind kind() {
-        String f = filename().toUpperCase();
+    public Kind kind() { return kindOf(filename()); }
+
+    /** 静态版（只有文件名时用：自动回传判定、事件流） */
+    public static Kind kindOf(String filename) {
+        String f = filename == null ? "" : filename.toUpperCase();
         if (f.endsWith(".JPG") || f.endsWith(".JPEG")) return Kind.JPG;
         if (f.endsWith(".NEF") || f.endsWith(".NRW")) return Kind.NEF;
         if (f.endsWith(".MP4") || f.endsWith(".MOV")) return Kind.MP4;
         return Kind.OTHER;
+    }
+
+    /** 去扩展名的基名（大写）：RAW+JPG 配对按同基名判定（尼康同一次拍摄同名 NEF+JPG） */
+    public static String baseName(String filename) {
+        String f = filename == null ? "" : filename;
+        int dot = f.lastIndexOf('.');
+        return (dot > 0 ? f.substring(0, dot) : f).toUpperCase();
+    }
+
+    public String baseName() { return baseName(filename()); }
+
+    /** 拍摄日期键 yyyyMMdd（captureDate 原始串 "yyyyMMdd'T'HHmmss" 前 8 位）；无日期返回 "" */
+    public String dateKey() {
+        String d = info != null ? info.captureDate : null;
+        return (d != null && d.length() >= 8) ? d.substring(0, 8) : "";
     }
 
     /** PTP 拍摄日期串 "yyyyMMdd'T'HHmmss"，可直接字典序比较；空串排最后 */

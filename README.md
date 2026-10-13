@@ -24,6 +24,14 @@
   - **曝光参数调节**：光圈/快门/ISO/曝光补偿/白平衡可调，选项严格来自相机自报枚举/范围，SetDevicePropValue 写入后回读确认，失败展示相机返回码
   - **实时直方图**：取景帧降采样本地统计 RGB 三通道，纯内存不落盘，可开关
   - **机型门控**：Z 系 profile 遥控全开尝试；老单反/WU/Coolpix 默认仅状态面板+快门，其余标注「未验证」，诊断页有实验开关可手动放行；任何遥控操作失败只降级该功能，不拖垮图传主链路
+- 🔁 **图传增强（v0.3.0，待真机逐项验证）**：
+  - **拍完自动回传**：「照片」页开关（默认关）开启后，连接期间相机拍的新照片（遥控拍摄或直接按相机快门都算）经 ObjectAdded 事件自动排队下载到相册，可选仅 JPG / JPG+RAW；与已下载记录去重不重复传；开启状态在图库页顶部黄色横幅明示。依赖事件通道推送——事件通道不可靠的机型（WU/Coolpix 等）不会触发，界面会注明
+  - **已下载记录与筛选**：本地轻量记录已下载对象（文件名/handle/大小，App 私有 TSV 文件，约 50 字节/条）；图库筛选条：全部 / 未下载 / 仅 JPG / 仅 RAW / 按日期（日期列表只列卡上实际存在的日期，自绘深色卡选择）；每格角标区分 已下载（绿）/ 未下载（灰）/ 部分已传（黄）
+  - **RAW+JPG 配对折叠**：同名 NEF+JPG 折叠为一条（双徽标），点开可选 两个都下 / 只下 JPG / 只下 RAW，多选计数按文件数算；长按一条可整行全选/全清
+- 🗂️ **相机管理（v0.3.0，待真机逐项验证）**：
+  - **删除照片**：单张/批量走标准 DeleteObject(0x100B)，先弹自绘深色确认卡（列明张数与「删的是相机卡上的原文件、不可恢复」），逐张执行、失败逐张点名报告；删后同步刷新列表与已下载记录
+  - **格式化存储卡**：FormatStore(0x100F)。高危三重防护：入口默认被诊断页实验开关门控（未开不可见）→ 普通确认卡讲清后果 → 长按确认按钮满 2 秒才执行。**未真机验证前请勿对主力卡使用**
+  - **间隔拍摄**：遥控页可设间隔秒数与总张数（0=无限至手动停），前台服务保活执行、进度可见、可随时停；走 v0.2 遥控拍摄链，任一张失败立刻报错停下（不静默重试）；与自动回传同开可拍一张传一张
 
 ## 📱 兼容机型与物理限制
 
@@ -44,7 +52,7 @@
 
 ## 📦 安装
 
-到本仓库的 **Releases** 下载最新 APK 直接安装（安卓 8.0+）。当前最新版 v0.2.0。
+到本仓库的 **Releases** 下载最新 APK 直接安装（安卓 8.0+）。当前最新版 v0.3.0。
 
 ## ✍️ 作者
 
@@ -58,6 +66,7 @@
 
 ## 📝 更新日志
 
+- **v0.3.0（2026-10-13）**：图传增强 + 相机管理（均待真机逐项验证）：拍完自动回传（事件驱动、开关默认关、仅 JPG 或 JPG+RAW、已下载记录去重、图库顶部横幅明示）、已下载记录（轻量 TSV，约 50B/条）与筛选条（未下载/仅 JPG/仅 RAW/按日期）+ 已下载角标、RAW+JPG 配对折叠（可选只下其一、计数按文件数）；删除照片（DeleteObject，确认卡+逐张报告）、格式化存储卡（FormatStore，实验开关门控+双重确认+长按 2 秒，未真机验证前勿对主力卡使用）、间隔拍摄（前台服务保活、失败即停报错、可与自动回传组合）。
 - **v0.2.0（2026-10-13）**：遥控监看全套（均待真机逐项验证）：相机状态面板、实时取景（流水线冲稳定 30fps + 自适应锁档）、点按对焦、遥控快门/录像、曝光参数调节、实时直方图、拍完即览；遥控功能按机型 profile 门控。连接层完成 libgphoto2 开源对标审计并修复 4 处（事务 ID 统一管理、事件通道连接重试、命令通道空闲保活、InitFail 诊断释义，详见「开源对标结论」）。
 - **v0.1.1（2026-10-13）**：软件更名为「清木图传」（原名咕嘎图传），包名改为 com.qingmu.tuchuan；启动器图标更换为简约点阵相机；功能与 v0.1.0 完全一致。
 - **v0.1.0（2026-10-13）**：首个版本。PTP/IP 双入口连接、缩略图墙、批量下载 + 断点续传 + 自动重连、连接诊断、多机型 profile。
@@ -71,7 +80,7 @@
 - 目录仿咕嘎音乐：源码 `app/src/main`，手动管线 `build-manual/build.sh <code> <name>`
   （aapt2 → javac -source 8 → d8 → zipalign → apksigner，调试签名与咕嘎音乐同一把）。
 - 框架-only：纯 Java + Android framework API，零 AndroidX、零第三方库。
-- 产物：`qingmu-tuchuan-v0.2.0.apk`（96,706 字节，minSdk 26 / targetSdk 34）。
+- 产物：`qingmu-tuchuan-v0.3.0.apk`（117,615 字节，minSdk 26 / targetSdk 34）。
 - UI：B 尼康黄黑风（纯黑 #000 + 尼康黄 #FFDE00），颜色集中在 `Ui.java` + themes.xml；
   图标全量 VectorDrawable（清单见文末），无 PNG、无 emoji 图标。
 
@@ -79,15 +88,18 @@
 
 | 文件 | 职责 |
 |---|---|
-| `PtpIpClient.java` | PTP/IP 双通道客户端：Init 握手、PTP 操作层（含发数据事务）、事件线程+回调、10s 心跳/45s 判死、命令通道空闲保活、指数退避重连、GetObject/GetPartialObject 流式下载、属性体系（PropDesc/类型化读写）、尼康私有操作封装 |
+| `PtpIpClient.java` | PTP/IP 双通道客户端：Init 握手、PTP 操作层（含发数据事务）、事件线程+回调、10s 心跳/45s 判死、命令通道空闲保活、指数退避重连、GetObject/GetPartialObject 流式下载、属性体系（PropDesc/类型化读写）、尼康私有操作封装；v0.3 加标准 DeleteObject/FormatStore |
 | `CameraProfile.java` | 机型 profile 表（Model 包含匹配）：DEFAULT / Z_FC / Z_50_30 / Z_FULLFRAME / Z_GENERIC / DSLR_WIFI_850_780 / DSLR_WIFI_MID / WU_ADAPTER / COOLPIX_WIFI；v0.2 加遥控等级（FULL / BASIC） |
-| `RemoteController.java` | v0.2 遥控中枢：profile 门控 + 功能级失败降级、状态面板/参数读写编排、LiveView 三级流水线与自适应锁档、点按对焦/快门/录像、事件→拍完即览 |
+| `RemoteController.java` | v0.2 遥控中枢：profile 门控 + 功能级失败降级、状态面板/参数读写编排、LiveView 三级流水线与自适应锁档、点按对焦/快门/录像、事件→拍完即览；v0.3 事件流加自动回传判定（格式范围+会话去重，入队交给 MainActivity 的处理器并二次查记录/队列去重） |
+| `DownloadRecord.java` | v0.3 已下载记录：App 私有 TSV（文件名/handle/大小/时间，约 50B/条）+ 内存 Map，变更整文件重写（tmp+改名）；首次启动把 v0.2 的 SharedPreferences done_files 登记迁移进来 |
+| `IntervalService.java` | v0.3 间隔拍摄前台 Service：固定间隔循环 nikonCapture、WakeLock+通知进度、随时可停、任一张失败报错即停 |
+| `ConfirmCard.java` | v0.3 自绘深色确认卡组件：普通确认 + 长按满 2 秒确认（格式化专用）两种模式 |
 | `CamProps.java` | 属性元数据表 + 显示格式化（只对 PTP 规范明确的单位/枚举做语义化，其余显示相机原值不编造） |
 | `HudView.java` | 取景叠加层（Canvas 自绘）：三分网格、AF 框、RGB 直方图；与点击共用 FIT_CENTER 显示矩形换算 |
 | `CameraWifi.java` | 入口①相机 AP：WifiNetworkSpecifier（API29+），bindProcessToNetwork + Network SocketFactory 双保险；低版本手动连热点兜底 |
 | `ThumbCache.java` | 缩略图三级缓存：内存 LruCache 24MB → 磁盘（可关）→ GetThumb 懒加载；失败按 profile 降级 |
-| `DownloadService.java` | 前台 Service 下载队列：.part 续传 → Partial 报错整传降级 → IO 断线重连续传（≤4 轮）；MediaStore 发布 Pictures/QingmuTuchuan + 已传登记防重复 |
-| `MainActivity.java` | 四页 UI：连接（双入口+设备卡+兼容性说明）/ 照片（网格多选+进度）/ 遥控（状态面板+取景+拍摄+参数调节+拍完即览）/ 诊断（300 行日志+复制+遥控实验开关） |
+| `DownloadService.java` | 前台 Service 下载队列：.part 续传 → Partial 报错整传降级 → IO 断线重连续传（≤4 轮）；MediaStore 发布 Pictures/QingmuTuchuan + 已传登记防重复；v0.3 成功后同步写 DownloadRecord，并提供队列文件名集合供自动回传去重 |
+| `MainActivity.java` | 四页 UI：连接（双入口+设备卡+兼容性说明+相机管理/格式化）/ 照片（网格多选+进度+v0.3 自动回传卡/筛选条/配对折叠/已下载角标/删除）/ 遥控（状态面板+取景+拍摄+参数调节+拍完即览+v0.3 间隔拍摄）/ 诊断（300 行日志+复制+遥控实验开关） |
 | `Diag.java` | 全局诊断日志（环形 300 行），协议每个关键节点必打：握手阶段、操作码/响应码、PROFILE 命中、重连次数、续传偏移、遥控每操作响应码与耗时、LiveView 每 5 秒帧率/耗时/帧间隔抖动汇总 |
 
 ## 协议要点（libgphoto2 ptpip.c 实证）
@@ -103,6 +115,8 @@
 - v0.2 发数据阶段（SetDevicePropValue 0x1016 用）：DataPhaseInfo=2，StartData(负载=事务ID+uint64 总长) → Data 分块 ≤64KB → EndData 收尾，与 gphoto `ptp_ptpip_senddata` 对齐。
 - v0.2 事务 ID 改由 transact 统一分配递增（仅 OpenSession 固定 0）；事件通道新增回调分发（ObjectAdded 0x4002 / CaptureComplete 0x400D / DevicePropChanged 0x4006）。
 - v0.2 空闲保活：心跳线程监测命令通道，>10s 无成功事务且通道空闲时发一次轻量电量查询刷新机身空闲计时器。
+- v0.3 标准管理操作：DeleteObject(0x100B) 双参数 (handle, objectFormatCode)——libgphoto2 ptp.c 的 ptp_deleteobject 用 PTP_CNT_INIT(handle, ofc) 原样对齐；FormatStore(0x100F) 只发 1 参数 (storageID)——libgphoto2 ptp.h:4476 宏 ptp_formatstore 定义为 ptp_generic_no_data(...,1,storageid)，规范的可选第二参（文件系统格式）不发、由相机取默认。
+- v0.3 自动回传触发条件：事件通道 ObjectAdded(0x4002) + 开关开 + 格式在所选范围；去重三层——RemoteController 会话内 handle 集合 → DownloadRecord 文件名 → DownloadService 队列文件名集合。
 
 ## 开源对标结论（v0.2 连接审计 + 操作码出处）
 
@@ -141,6 +155,8 @@
 | InitiateCaptureRecInMedia | 0x9207（2 参：先 AF=0xFFFFFFFE、存卡=0；参数不支持降级 1 参版） | ptp.h ptp_nikon_capture2 / capture2_1 |
 | StartMovieRecInCard / EndMovieRec | 0x920A / 0x920B | ptp.h |
 | LiveView 帧尺寸属性 LiveViewImageSize | 0xD1AC（UINT8 枚举 1=QVGA/2=VGA/3=XGA，实际取值以相机 desc 自报为准） | ptp.h + config.c nikon_liveviewsize 表 |
+| DeleteObject（删除卡上对象） | 0x100B（参数 handle + objectFormatCode，与 gphoto 调用方一致传对象实际格式码） | ptp.h:234 + ptp.c ptp_deleteobject |
+| FormatStore（格式化存储） | 0x100F（仅 1 参数 storageID） | ptp.h:238 + ptp.h:4476 ptp_formatstore 宏 |
 | 响应码 NotLiveView / OutOfFocus / InvalidStatus | 0xA00B / 0xA002 / 0xA004 | ptp.h |
 
 注：0x5013 经核实是 StillCaptureMode（连拍模式），**不是**剩余可拍张数；剩余张数取自 GetStorageInfo 的 NumberOfImages（相机估算）并在界面注明来源。
@@ -152,6 +168,7 @@
 3. 事件通道建不起来 / profile 声明不可靠 → 纯命令通道模式，状态栏标注「功能受限」。
 4. 任一通道 IO 断裂 → 指数退避（1/2/4/8/15s）重连 + OpenSession 重建 + 队列 .part 续传。
 5. v0.2 遥控降级：任一遥控功能连续失败 3 次 → 本次会话内禁用该功能并在遥控页置灰提示，图传主链路不受影响；LiveView 取帧反复 NotLiveView 自动重启取景，超限才降级。
+6. v0.3 专项：自动回传在事件通道不可用时不触发（界面明示原因，不假装开启有效）；删除逐张执行、单张失败不中断其余、结果点名失败文件与响应码；间隔拍摄任一张失败立即停并报错，不重试不跳张；格式化只有相机回 OK 才清本地列表/记录并提示成功，回任何其他码都按失败处理。
 
 ## 已实现 / 未实现（诚实清单）
 
@@ -161,6 +178,10 @@
 v0.2 新增（代码完整、**待真机逐项验证**，不视为已实测）：状态面板（属性全走相机 desc 自报）、
 LiveView 流水线取景 + 自适应锁档、点按对焦、遥控快门/录像、曝光参数调节、实时直方图、
 拍完即览、机型遥控门控 + 诊断页实验开关、连接层审计 4 项修复。
+v0.3 新增（代码完整、**待真机逐项验证**，不视为已实测）：拍完自动回传、已下载记录与
+图库筛选（全部/未下载/仅 JPG/仅 RAW/按日期）、已下载角标、RAW+JPG 配对折叠与分开勾选、
+删除照片（单张/批量）、格式化存储卡（实验开关门控+双重确认+长按 2 秒）、间隔拍摄
+（前台服务保活、与自动回传可组合）。
 
 占位/未实现：
 - LiveView 帧头里的 AF 框字段未解析（gphoto 同样未解析）：当前 AF 框显示的是用户点按位置，首帧诊断会打印帧头前 32B 十六进制，真机回来按实测偏移再解析相机回传的合焦框。
@@ -168,6 +189,8 @@ LiveView 流水线取景 + 自适应锁档、点按对焦、遥控快门/录像�
 - 占位图点击手动重试缩略图未接（自动重试已按 profile 生效）。
 - STA 模式下相机「连接至 PC」的配对确认弹窗行为（相机屏需按 OK）未实测，可能需要用户在相机上确认一次。
 - 密码以明文存 App 私有 SharedPreferences（v0.1 图省事，后续可换加密存储）。
+- v0.3 已下载记录以文件名为主键：同一张卡内文件名唯一，但**换卡后若新卡出现同名文件**（如另一张卡也有 DSC_0001.JPG），会被误判为已下载——真机联调时留意；后续可考虑加入卡序列号维度。
+- v0.3 自动回传在 App 被系统切到后台时，入队拉起前台下载服务可能被安卓 12+ 的后台启动限制拦截（已记诊断明确提示，不会静默丢失）；间隔拍摄+自动回传组合使用时建议保持 App 在前台。
 
 ## 待真机验证清单（按机型家族）
 
@@ -215,6 +238,24 @@ LiveView 流水线取景 + 自适应锁档、点按对焦、遥控快门/录像�
 
 LiveView 帧率口径：**30fps 是工程目标，不是已达成指标**。达标判据看诊断页「LIVEVIEW 5s 汇总」行——呈现 fps、帧间隔 min/max/p95/标准差三项齐看；真机实测值待联调回填本表。
 
+## 图传增强 + 相机管理待真机验证表（v0.3.0）
+
+> 状态说明：与 v0.2 同口径——全部「待验证」，代码已按 libgphoto2 源码实现并通过编译与静态验真，无相机在手，任何一行都不得视为已实测可用。
+
+| 机型组（profile） | 自动回传 | 筛选/配对/角标 | 删除照片 | 格式化 | 间隔拍摄 |
+|---|---|---|---|---|---|
+| Z fc（Z_FC，首测） | 待验证（事件通道理应可用） | 纯本地逻辑，连接后可用 | 待验证 | 待验证 ⚠ 先用空卡试 | 待验证 |
+| Z 50/Z 30 / Z 全幅 / 其他 Z 系 | 待验证 | 纯本地逻辑 | 待验证 | 待验证 ⚠ | 待验证 |
+| D850/D780 / 中端单反（BASIC） | 待验证（事件通道视机型） | 纯本地逻辑 | 待验证 | 待验证 ⚠（实验开关门控） | 待验证（快门默认开放；机身模式不支持时应报错即停） |
+| WU-1a/1b 适配器（WU_ADAPTER） | **预期不可用**：profile 按事件通道不可靠处理，自动回传不会触发（界面明示） | 纯本地逻辑 | 待验证（带宽低，逐张较慢） | 待验证 ⚠（实验开关门控） | 待验证（快门默认开放） |
+| Coolpix Wi-Fi（COOLPIX_WIFI） | **预期不可用**：同 WU（事件通道按不可靠处理） | 纯本地逻辑 | 待验证 | 待验证 ⚠（实验开关门控） | 待验证 |
+| 未知机型（DEFAULT） | 待验证（取决于事件通道是否建成） | 纯本地逻辑 | 待验证 | 待验证 ⚠（实验开关门控） | 待验证 |
+
+联调重点：①自动回传与手动下载/间隔拍摄并发时去重是否严密（同一文件不许下两遍）；
+②删除写保护/正在被相机占用的文件时相机回什么码、逐张报告是否属实；
+③格式化在不同机型上 FormatStore 的实际行为（**首试务必用空卡**）；
+④间隔拍摄在机身处于不支持遥控的模式（如某些机身需切到特定模式）时是否如实报错停下。
+
 ## 矢量图标清单（res/drawable，全部 <vector> 手写 pathData）
 
 - ic_launcher_foreground.xml — 启动器 adaptive icon 前景（定稿：点阵相机——30×30 统一栅格圆点阵，白点勾勒机身双线轮廓、黄点实心镜头盘+白点外环、右上黄点方块、机顶黄点簇，纯黑底由 ic_launcher_background 提供；由 `tools/gen_launcher_icon.py` 生成，白点 213 + 黄点 64 合并为 2 条 path）
@@ -237,4 +278,9 @@ LiveView 帧率口径：**30fps 是工程目标，不是已达成指标**。达�
 - ic_shutter.xml — 快门圆环 + 内圆（拍摄按钮，v0.2）
 - ic_rec.xml — 录像实心圆点（录像按钮，v0.2）
 - ic_stop.xml — 停止实心方块（停止录像按钮，v0.2）
-- 形状类（非图标）：bg_capsule_on/off、bg_card、bg_input、bg_btn_primary/ghost、bg_thumb_selected
+- ic_delete.xml — 垃圾桶（删除所选/格式化按钮，v0.3）
+- ic_filter.xml — 漏斗（筛选条，v0.3）
+- ic_auto.xml — 上下双箭头（拍完自动回传卡，v0.3）
+- ic_calendar.xml — 日历（日期筛选，v0.3）
+- ic_timer.xml — 秒表（间隔拍摄卡/服务通知，v0.3）
+- 形状类（非图标）：bg_capsule_on/off、bg_card、bg_input、bg_btn_primary/ghost、bg_thumb_selected、bg_chip（v0.3 图库角标底衬）

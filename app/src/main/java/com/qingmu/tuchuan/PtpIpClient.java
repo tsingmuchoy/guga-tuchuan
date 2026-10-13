@@ -63,6 +63,10 @@ public class PtpIpClient {
     public static final int OP_INITIATE_CAPTURE      = 0x100E;
     public static final int OP_GET_DEVICE_PROP_DESC  = 0x1014;
     public static final int OP_SET_DEVICE_PROP_VALUE = 0x1016;
+    // v0.3 相机管理（libgphoto2 ptp.h:234/238 核实；ptp.c ptp_deleteobject 双参、ptp.h:4476 ptp_formatstore 单参）
+    public static final int OP_DELETE_OBJECT         = 0x100B; // DeleteObject(handle, objectFormatCode)
+    public static final int OP_FORMAT_STORE          = 0x100F; // FormatStore(storageId)（gphoto 宏只发 1 参）
+    public static final int RC_OPERATION_NOT_SUPPORTED = 0x2005;
 
     public static final int RC_OK = 0x2001;
     public static final int RC_DEVICE_BUSY = 0x2019;
@@ -899,6 +903,46 @@ public class PtpIpClient {
 
     public int nikonStartMovieRec() { return nikonOp(NK_START_MOVIE_REC, null, "StartMovieRecInCard"); }
     public int nikonEndMovieRec() { return nikonOp(NK_END_MOVIE_REC, null, "EndMovieRec"); }
+
+    // ================= v0.3 相机管理（标准操作，libgphoto2 ptp.h/ptp.c 核实） =================
+
+    /** 通用无数据操作封装（与 nikonOp 同口径：记诊断、返回响应码，IO 错误=-1） */
+    private int ptpOp(int op, int[] params, String name) {
+        long t0 = System.currentTimeMillis();
+        try {
+            transact(op, params, null);
+            Diag.op("PTP", name + "(0x" + Integer.toHexString(op) + ") → rc=0x2001 耗时 "
+                    + (System.currentTimeMillis() - t0) + "ms");
+            return RC_OK;
+        } catch (PtpException e) {
+            Diag.op("PTP", name + "(0x" + Integer.toHexString(op) + ") → rc=0x"
+                    + Integer.toHexString(e.responseCode) + " 耗时 " + (System.currentTimeMillis() - t0) + "ms");
+            return e.responseCode;
+        }
+    }
+
+    /**
+     * 删除相机卡上的单个对象：DeleteObject(0x100B)，双参数 (handle, objectFormatCode)，
+     * 与 libgphoto2 ptp.c ptp_deleteobject 的 PTP_CNT_INIT(..., handle, ofc) 完全一致
+     * （ofc 传对象实际格式码；未知时传 0=未指定格式）。不可逆，调用方必须先经用户确认。
+     */
+    public int deleteObject(int handle, int formatCode) {
+        Diag.op("PTP", "DeleteObject 开始 handle=0x" + Integer.toHexString(handle)
+                + " format=0x" + Integer.toHexString(formatCode));
+        return ptpOp(OP_DELETE_OBJECT, new int[]{handle, formatCode}, "DeleteObject");
+    }
+
+    /**
+     * 格式化存储：FormatStore(0x100F)，libgphoto2 ptp.h:4476 宏 ptp_formatstore 只发 1 个参数
+     * (storageId)（PTP 规范的第二参 FilesystemFormat 可选，gphoto 不发 → 相机用默认格式）。
+     * 高危不可逆：会清空该存储上的全部对象，调用方必须双重确认后才可调用。
+     */
+    public int formatStore(int storageId) {
+        Diag.op("PTP", "⚠ FormatStore 开始 storageId=0x" + Integer.toHexString(storageId) + "（清空该存储全部对象）");
+        int rc = ptpOp(OP_FORMAT_STORE, new int[]{storageId}, "FormatStore");
+        Diag.op("PTP", "⚠ FormatStore 结束 rc=0x" + Integer.toHexString(rc));
+        return rc;
+    }
 
     public int[] getStorageIds() throws PtpException {
         Result r = transact(OP_GET_STORAGE_IDS, null, null);

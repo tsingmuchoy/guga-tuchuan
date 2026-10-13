@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 日期：日历（外框 evenOdd 镂空内窗 + 挂耳 + 日期点） -->
+    <path android:fillColor="#FFFFFF" android:fillType="evenOdd"
+        android:pathData="M4,5 L20,5 L20,21 L4,21 Z M6,10.5 L18,10.5 L18,19 L6,19 Z"/>
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M7,2.6 L9.2,2.6 L9.2,6.4 L7,6.4 Z M14.8,2.6 L17,2.6 L17,6.4 L14.8,6.4 Z M7.2,12.6 L9.8,12.6 L9.8,15.2 L7.2,15.2 Z M10.7,12.6 L13.3,12.6 L13.3,15.2 L10.7,15.2 Z M14.2,12.6 L16.8,12.6 L16.8,15.2 L14.2,15.2 Z"/>
+</vector>

@@ -1,0 +1,12 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 间隔拍摄：秒表（顶钮 + evenOdd 表圈环 + 指针） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M10.1,1.8 L13.9,1.8 L13.9,4.4 L10.1,4.4 Z"/>
+    <path android:fillColor="#FFFFFF" android:fillType="evenOdd"
+        android:pathData="M12,4.6 m-7.6,0 a7.6,7.6 0 1 0 15.2,0 a7.6,7.6 0 1 0 -15.2,0 M12,7.3 m-4.9,0 a4.9,4.9 0 1 0 9.8,0 a4.9,4.9 0 1 0 -9.8,0"/>
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M11,8.6 L13,8.6 L13,11.8 L15.8,13.9 L14.7,15.5 L11,13 Z"/>
+</vector>
