@@ -59,9 +59,56 @@ public class PtpIpClient {
     public static final int OP_GET_THUMB         = 0x100A;
     public static final int OP_GET_DEVICE_PROP_VALUE = 0x1015;
     public static final int OP_GET_PARTIAL_OBJECT    = 0x101B;
+    // v0.2 新增标准操作码（libgphoto2 ptp.h:237/243/245 核实）
+    public static final int OP_INITIATE_CAPTURE      = 0x100E;
+    public static final int OP_GET_DEVICE_PROP_DESC  = 0x1014;
+    public static final int OP_SET_DEVICE_PROP_VALUE = 0x1016;
 
     public static final int RC_OK = 0x2001;
+    public static final int RC_DEVICE_BUSY = 0x2019;
+    public static final int RC_PARAMETER_NOT_SUPPORTED = 0x2006;
+    public static final int RC_NIKON_OUT_OF_FOCUS = 0xA002;
+    public static final int RC_NIKON_INVALID_STATUS = 0xA004;
+    public static final int RC_NIKON_NOT_LIVE_VIEW = 0xA00B;
+
+    // ---- 设备属性码（PTP 标准 + 本版用到的） ----
     public static final int PROP_BATTERY_LEVEL = 0x5001;
+    public static final int PROP_WHITE_BALANCE = 0x5005;
+    public static final int PROP_F_NUMBER      = 0x5007;
+    public static final int PROP_FOCUS_MODE    = 0x500A;
+    public static final int PROP_EXPOSURE_TIME = 0x500D;
+    public static final int PROP_EXPOSURE_PROGRAM = 0x500E; // 拍摄模式 P/A/S/M
+    public static final int PROP_EXPOSURE_INDEX   = 0x500F; // ISO
+    public static final int PROP_EXPOSURE_BIAS    = 0x5010; // 曝光补偿 INT16 千分之一 EV
+    public static final int PROP_STILL_CAPTURE_MODE = 0x5013; // 单拍/连拍（libgphoto2 ptp.h:1959 核实，非剩余张数）
+    public static final int PROP_NIKON_LIVE_VIEW_STATUS = 0xD1A2; // UINT8，1=LiveView 中
+    public static final int PROP_NIKON_LIVE_VIEW_IMAGE_SIZE = 0xD1AC; // UINT8 枚举 1=QVGA/2=VGA/3=XGA（libgphoto2 ptp.h:2643 + config.c nikon_liveviewsize 表核实；相机是否提供以其 desc 自报为准）
+
+    // ---- PTP 数据类型（libgphoto2 ptp.h:1911-1935） ----
+    public static final int DTC_INT8 = 0x0001, DTC_UINT8 = 0x0002;
+    public static final int DTC_INT16 = 0x0003, DTC_UINT16 = 0x0004;
+    public static final int DTC_INT32 = 0x0005, DTC_UINT32 = 0x0006;
+    public static final int DTC_INT64 = 0x0007, DTC_UINT64 = 0x0008;
+    public static final int DTC_STR = 0xFFFF;
+
+    // ---- 事件码 ----
+    public static final int EC_OBJECT_ADDED = 0x4002;
+    public static final int EC_DEVICE_PROP_CHANGED = 0x4006;
+    public static final int EC_CAPTURE_COMPLETE = 0x400D;
+
+    // ---- 尼康私有操作码（libgphoto2 ptp.h 核实行号见各常量注释；禁止凭记忆改） ----
+    public static final int NK_INITIATE_CAPTURE_SDRAM = 0x90C0; // ptp.h:581，1 参 0xFFFFFFFF
+    public static final int NK_AF_DRIVE        = 0x90C1; // ptp.h:582 无参
+    public static final int NK_CHANGE_CAMERA_MODE = 0x90C2; // ptp.h:583，1 参（1=控制模式）
+    public static final int NK_DEVICE_READY    = 0x90C8; // ptp.h:589 无参；wait-busy 轮询用（library.c nikon_wait_busy）
+    public static final int NK_START_LIVE_VIEW = 0x9201; // ptp.h:600 无参
+    public static final int NK_END_LIVE_VIEW   = 0x9202; // ptp.h:601 无参
+    public static final int NK_GET_LIVE_VIEW_IMG = 0x9203; // ptp.h:602 data-in；帧内扫描 FFD8 取 JPEG（library.c gp_camera_capture_preview）
+    public static final int NK_CHANGE_AF_AREA  = 0x9205; // ptp.h:604，2 参 x/y（LV 图像像素坐标，config.c 原样透传 + N-Link v3.1.0 实证）
+    public static final int NK_AF_DRIVE_CANCEL = 0x9206; // ptp.h:605 无参
+    public static final int NK_CAPTURE_TO_MEDIA = 0x9207; // ptp.h:610/5139，2 参 (af?0xFFFFFFFE:0xFFFFFFFF, target card=0/sdram=1)；1 参版 ptp.h:5153
+    public static final int NK_START_MOVIE_REC = 0x920A; // ptp.h:614 无参
+    public static final int NK_END_MOVIE_REC   = 0x920B; // ptp.h:615 无参
 
     public static final String DEFAULT_HOST = "192.168.1.1";
     public static final int DEFAULT_PORT = 15740;
@@ -81,6 +128,13 @@ public class PtpIpClient {
     public interface Progress { void onProgress(long doneBytes); }
 
     public interface ConnectionListener { void onDisconnected(String reason); }
+
+    /**
+     * 相机事件回调（ObjectAdded/CaptureComplete/DevicePropChanged 等）。
+     * 在事件线程上调用，只许做轻量通知（转发到自己的工作线程），不许在此直接发 PTP 命令：
+     * 命令通道有独立串行锁，在事件线程里阻塞等锁会堵住心跳 Pong 回应。
+     */
+    public interface EventListener { void onEvent(int code, int[] params); }
 
     // ---- 数据集模型 ----
     public static class DeviceInfo {
@@ -117,6 +171,10 @@ public class PtpIpClient {
     private volatile boolean closing = false;
     private volatile CameraProfile profile;
     private volatile long lastEvtRxMs = 0;
+    private volatile long lastCmdOkMs = 0;
+    private volatile boolean cmdBusy = false;
+    private volatile boolean keepAliveInFlight = false;
+    private volatile EventListener eventListener;
     private final Object cmdLock = new Object();
     private int transactionId = 0;
     private long connectionNumber = -1;
@@ -132,6 +190,7 @@ public class PtpIpClient {
     }
 
     public void setConnectionListener(ConnectionListener l) { connListener = l; }
+    public void setEventListener(EventListener l) { eventListener = l; }
     public boolean isConnected() { return connected; }
     public boolean isEventChannelOk() { return eventOk; }
     public CameraProfile getProfile() { return profile; }
@@ -188,6 +247,8 @@ public class PtpIpClient {
         Packet ack = readPacket(cmdIn);
         if (ack.type == PKT_INIT_FAIL) {
             int reason = ack.payload.length >= 4 ? Le.get32(ack.payload, 0) : -1;
+            // N-Link README 实证：STA 模式 reason=1 多为「本机未在相机端注册主机」或相机不在连接等待画面
+            Diag.op("PTPIP", "InitFail reason=" + reason + "（STA 模式下常见于未注册主机/相机不在等待画面；AP 模式下多为已有客户端占用，先强停 SnapBridge）");
             throw new IOException("相机拒绝初始化 InitFail reason=" + reason);
         }
         if (ack.type != PKT_INIT_CMD_ACK || ack.payload.length < 20) {
@@ -205,8 +266,24 @@ public class PtpIpClient {
         eventOk = false;
         try {
             Diag.op("PTPIP", "连接事件通道");
-            evtSock = newSocket(network);
-            evtSock.connect(new InetSocketAddress(h, p), 8000);
+            // libgphoto2 ptpip.c 实证：事件通道 connect 被拒（相机未就绪）时重试 2 次再放弃；
+            // 这里重试 3 次、间隔 300ms，仍失败才降级纯命令通道。
+            IOException lastConnErr = null;
+            for (int attempt = 1; attempt <= 3 && evtSock == null; attempt++) {
+                Socket s = newSocket(network);
+                try {
+                    s.connect(new InetSocketAddress(h, p), 8000);
+                    evtSock = s;
+                } catch (IOException ce) {
+                    lastConnErr = ce;
+                    try { s.close(); } catch (Exception ignore) {}
+                    if (attempt < 3) {
+                        Diag.op("PTPIP", "事件通道 connect 第 " + attempt + " 次失败（" + ce.getMessage() + "），300ms 后重试");
+                        try { Thread.sleep(300); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new IOException("interrupted"); }
+                    }
+                }
+            }
+            if (evtSock == null) throw lastConnErr != null ? lastConnErr : new IOException("事件通道 connect 失败");
             evtSock.setTcpNoDelay(true);
             evtIn = evtSock.getInputStream();
             evtOut = evtSock.getOutputStream();
@@ -291,13 +368,22 @@ public class PtpIpClient {
                         case PKT_EVENT: {
                             int code = pkt.payload.length >= 2 ? Le.get16(pkt.payload, 0) : 0;
                             long tid = pkt.payload.length >= 6 ? Le.get32u(pkt.payload, 2) : 0;
+                            int np = pkt.payload.length >= 6 ? (pkt.payload.length - 6) / 4 : 0;
+                            int[] eparams = new int[np];
                             StringBuilder sb = new StringBuilder();
-                            for (int off = 6; off + 4 <= pkt.payload.length; off += 4) {
+                            for (int i = 0; i < np; i++) {
+                                eparams[i] = Le.get32(pkt.payload, 6 + 4 * i);
                                 if (sb.length() > 0) sb.append(',');
-                                sb.append("0x").append(Integer.toHexString(Le.get32(pkt.payload, off)));
+                                sb.append("0x").append(Integer.toHexString(eparams[i]));
                             }
                             Diag.op("EVENT", "相机事件 code=0x" + Integer.toHexString(code)
                                     + " tid=" + tid + (sb.length() > 0 ? " params=" + sb : ""));
+                            EventListener el = eventListener;
+                            if (el != null) {
+                                try { el.onEvent(code, eparams); } catch (Exception cb) {
+                                    Diag.op("EVENT", "事件回调异常：" + cb.getMessage());
+                                }
+                            }
                             break;
                         }
                         case PKT_PING:
@@ -336,6 +422,21 @@ public class PtpIpClient {
                     markDead("事件通道静默超时");
                     return;
                 }
+                // 空闲保活（命令通道）：尼康机身有空闲计时器，长时间无事务会被关会话。
+                // 同行实证：N-Link v3.0.0「空闲 10 秒即刷新机身计时器」。这里距上次成功事务
+                // >10s 且命令通道空闲（非下载/取景事务中）时发一次轻量电量查询刷新计时器；
+                // 放在短线程执行不堵心跳；失败只记诊断，IO 异常由 transact 既有判死逻辑处理。
+                if (!cmdBusy && !keepAliveInFlight
+                        && System.currentTimeMillis() - lastCmdOkMs > 10000) {
+                    keepAliveInFlight = true;
+                    new Thread(() -> {
+                        try {
+                            int b = getBatteryLevel();
+                            if (b >= 0) Diag.op("PTPIP", "空闲保活：轻量查询成功（电量 " + b + "%），机身计时器已刷新");
+                        } catch (Exception ignore) {
+                        } finally { keepAliveInFlight = false; }
+                    }, "ptpip-keepalive").start();
+                }
             }
         }, "ptpip-heartbeat");
         heartbeatThread.setDaemon(true);
@@ -369,20 +470,37 @@ public class PtpIpClient {
 
     /** 通用事务：发请求 → 收数据阶段 → 收响应。dataSink 非空时数据流式回调，否则攒进 Result.data */
     private Result transact(int opCode, int[] params, DataSink sink) throws PtpException {
+        return transactInternal(opCode, params, null, sink);
+    }
+
+    /**
+     * 发数据阶段的事务（DataPhaseInfo=2）：发请求 → StartData/Data/EndData → 收响应。
+     * libgphoto2 ptpip.c ptp_ptpip_senddata 实证：StartData 负载=事务ID u32 + 总长
+     * （其实现写 u32 低半 + u32 清零，等价 u64 小端）；Data/EndData 负载=事务ID u32 + 数据，
+     * 分块 ≤64KB，最后一块用 EndData。
+     */
+    private Result transactSendData(int opCode, int[] params, byte[] dataOut) throws PtpException {
+        return transactInternal(opCode, params, dataOut != null ? dataOut : new byte[0], null);
+    }
+
+    private Result transactInternal(int opCode, int[] params, byte[] dataOut, DataSink sink) throws PtpException {
         synchronized (cmdLock) {
             if (!connected || cmdOut == null) throw new PtpException("未连接", new IOException("not connected"));
-            int tid = transactionId;
+            // 事务 ID 由 transact 统一分配递增（v0.2 审计修复：原实现各调用方手动 ++，异常路径会漏增导致 tid 复用）
+            int tid = transactionId++;
+            cmdBusy = true;
             int n = params == null ? 0 : params.length;
             byte[] req = new byte[18 + 4 * n];
             Le.put32(req, 0, req.length);
             Le.put32(req, 4, PKT_OP_REQUEST);
-            Le.put32(req, 8, 1); // DataPhaseInfo：接收数据或无数据 = 1（libgphoto2 实证）
+            Le.put32(req, 8, dataOut != null ? 2 : 1); // DataPhaseInfo：发送数据=2，接收或无数据=1（libgphoto2 ptpip.c 实证）
             Le.put16(req, 12, opCode);
             Le.put32(req, 14, tid);
             for (int i = 0; i < n; i++) Le.put32(req, 18 + 4 * i, params[i]);
             String opName = "0x" + Integer.toHexString(opCode);
             try {
                 writeAll(cmdOut, req);
+                if (dataOut != null) sendDataPhase(tid, dataOut);
                 // 数据阶段 + 响应
                 ByteSink mem = sink == null ? new ByteSink() : null;
                 DataSink eff = sink != null ? sink : mem;
@@ -420,15 +538,42 @@ public class PtpIpClient {
                 Result r = new Result();
                 r.responseCode = respCode; r.respParams = respParams;
                 r.data = mem != null ? mem.toByteArray() : null;
+                lastCmdOkMs = System.currentTimeMillis();
+                cmdBusy = false;
                 return r;
             } catch (PtpException e) {
+                cmdBusy = false;
                 throw e;
             } catch (IOException e) {
+                cmdBusy = false;
                 Diag.op("PTP", opName + " tid=" + tid + " IO 异常：" + e.getMessage());
                 markDead("命令通道 IO 异常");
                 throw new PtpException("op " + opName + " IO: " + e.getMessage(), e);
             }
         }
+    }
+
+    /** 发数据阶段：StartData(tid+u64 总长) → Data 分块(≤64KB) → EndData 收尾（gphoto ptp_ptpip_senddata 对齐） */
+    private void sendDataPhase(int tid, byte[] data) throws IOException {
+        byte[] start = new byte[20];
+        Le.put32(start, 0, 20);
+        Le.put32(start, 4, PKT_START_DATA);
+        Le.put32(start, 8, tid);
+        Le.put32(start, 12, data.length);      // 总长低 32 位
+        Le.put32(start, 16, 0);                // 总长高 32 位（与 gphoto 写 u32+清零等价，合成为 u64）
+        writeAll(cmdOut, start);
+        int off = 0;
+        do {
+            int chunk = Math.min(65536, data.length - off);
+            boolean last = off + chunk >= data.length;
+            byte[] pkt = new byte[12 + chunk];
+            Le.put32(pkt, 0, pkt.length);
+            Le.put32(pkt, 4, last ? PKT_END_DATA : PKT_DATA);
+            Le.put32(pkt, 8, tid);
+            System.arraycopy(data, off, pkt, 12, chunk);
+            writeAll(cmdOut, pkt);
+            off += chunk;
+        } while (off < data.length);
     }
 
     private static class ByteSink implements DataSink {
@@ -449,11 +594,10 @@ public class PtpIpClient {
     }
 
     // ---- 会话 ----
-    /** OpenSession 固定用事务 0（PTP 惯例），之后自增 */
+    /** OpenSession 固定用事务 0（PTP 惯例）；transact 内部自增，后续事务从 1 起 */
     public void openSession() throws PtpException {
         transactionId = 0;
         transact(OP_OPEN_SESSION, new int[]{1}, null);
-        transactionId = 1;
         Diag.op("PTP", "OpenSession 成功（session=1）");
     }
 
@@ -465,7 +609,6 @@ public class PtpIpClient {
     // ---- 设备/存储 ----
     public DeviceInfo getDeviceInfo() throws PtpException {
         Result r = transact(OP_GET_DEVICE_INFO, null, null);
-        transactionId++;
         DeviceInfo di = new DeviceInfo();
         Cursor c = new Cursor(r.data);
         c.u16(); // StandardVersion
@@ -491,7 +634,6 @@ public class PtpIpClient {
     public int getBatteryLevel() {
         try {
             Result r = transact(OP_GET_DEVICE_PROP_VALUE, new int[]{PROP_BATTERY_LEVEL}, null);
-            transactionId++;
             if (r.data != null && r.data.length >= 1) return r.data[0] & 0xFF;
         } catch (Exception e) {
             Diag.op("PTP", "电量读取失败（忽略）：" + e.getMessage());
@@ -499,9 +641,267 @@ public class PtpIpClient {
         return -1;
     }
 
+    // ================= v0.2 属性体系（GetDevicePropDesc / 类型化读写） =================
+
+    /**
+     * 类型化属性值（DevicePropValue）：数值型统一存 num（按位存，显示层按 datatype 解释符号），
+     * 字符串存 str。编解码布局对齐 libgphoto2 ptp-pack.c 的 ptp_unpack_DPV。
+     */
+    public static class PropValue {
+        public final int datatype;
+        public long num;
+        public String str;
+        public PropValue(int datatype) { this.datatype = datatype; }
+        public PropValue(int datatype, long num) { this.datatype = datatype; this.num = num; }
+
+        public static int fixedSize(int dt) {
+            switch (dt) {
+                case DTC_INT8: case DTC_UINT8: return 1;
+                case DTC_INT16: case DTC_UINT16: return 2;
+                case DTC_INT32: case DTC_UINT32: return 4;
+                case DTC_INT64: case DTC_UINT64: return 8;
+                default: return -1; // STR 变长
+            }
+        }
+
+        /** 解码 buf[off..] 写入 v，返回占用字节数；数据不足返回 -1 */
+        static int decodeInto(PropValue v, byte[] buf, int off) {
+            if (buf == null || off < 0 || off >= buf.length && v.datatype != DTC_STR) return -1;
+            switch (v.datatype) {
+                case DTC_INT8: v.num = buf[off]; return 1;
+                case DTC_UINT8: v.num = buf[off] & 0xFF; return 1;
+                case DTC_INT16: v.num = (short) Le.get16(buf, off); return 2;
+                case DTC_UINT16: v.num = Le.get16(buf, off); return 2;
+                case DTC_INT32: v.num = Le.get32(buf, off); return 4;
+                case DTC_UINT32: v.num = Le.get32u(buf, off); return 4;
+                case DTC_INT64: case DTC_UINT64: v.num = Le.get64(buf, off); return 8;
+                case DTC_STR: {
+                    if (off >= buf.length) { v.str = ""; return 1; }
+                    int n = buf[off] & 0xFF;
+                    if (n == 0) { v.str = ""; return 1; }
+                    int bytes = Math.min((n - 1) * 2, Math.max(0, buf.length - off - 1));
+                    v.str = new String(buf, off + 1, bytes, StandardCharsets.UTF_16LE);
+                    return 1 + n * 2;
+                }
+                default: return -1;
+            }
+        }
+
+        public byte[] encode() {
+            switch (datatype) {
+                case DTC_INT8: case DTC_UINT8: return new byte[]{(byte) num};
+                case DTC_INT16: case DTC_UINT16: { byte[] b = new byte[2]; Le.put16(b, 0, (int) num); return b; }
+                case DTC_INT32: case DTC_UINT32: { byte[] b = new byte[4]; Le.put32(b, 0, (int) num); return b; }
+                case DTC_INT64: case DTC_UINT64: {
+                    byte[] b = new byte[8]; Le.put32(b, 0, (int) num); Le.put32(b, 4, (int) (num >> 32)); return b;
+                }
+                case DTC_STR: {
+                    String s = str != null ? str : "";
+                    byte[] body = s.getBytes(StandardCharsets.UTF_16LE);
+                    byte[] b = new byte[1 + body.length + 2];
+                    b[0] = (byte) (s.length() + 1);
+                    System.arraycopy(body, 0, b, 1, body.length);
+                    return b;
+                }
+                default: return new byte[0];
+            }
+        }
+
+        @Override public String toString() {
+            return datatype == DTC_STR ? ("\"" + str + "\"") : String.valueOf(num);
+        }
+    }
+
+    /** GetDevicePropDesc 解析结果（布局对齐 libgphoto2 ptp-pack.c ptp_unpack_DPD） */
+    public static class DevicePropDesc {
+        public int code, datatype, getSet, formFlag; // formFlag：0 无 / 1 范围 / 2 枚举
+        public PropValue defVal, curVal;
+        public PropValue rangeMin, rangeMax, rangeStep;
+        public final List<PropValue> enumValues = new ArrayList<>();
+        public boolean writable() { return getSet != 0; }
+    }
+
+    /** 读属性描述（取值集合/当前值/可写性全由相机自报）；失败抛 PtpException（带 rc） */
+    public DevicePropDesc getDevicePropDesc(int code) throws PtpException {
+        Result r = transact(OP_GET_DEVICE_PROP_DESC, new int[]{code}, null);
+        Cursor c = new Cursor(r.data);
+        DevicePropDesc d = new DevicePropDesc();
+        d.code = c.u16();
+        d.datatype = c.u16();
+        d.getSet = c.u8();
+        d.defVal = c.dpv(d.datatype);
+        d.curVal = c.dpv(d.datatype);
+        if (c.remaining() >= 1) {
+            d.formFlag = c.u8();
+            if (d.formFlag == 1) {
+                d.rangeMin = c.dpv(d.datatype);
+                d.rangeMax = c.dpv(d.datatype);
+                d.rangeStep = c.dpv(d.datatype);
+            } else if (d.formFlag == 2) {
+                int n = c.u16();
+                for (int i = 0; i < n; i++) {
+                    PropValue v = c.dpv(d.datatype);
+                    if (v == null) break;
+                    d.enumValues.add(v);
+                }
+            }
+        }
+        Diag.op("PROP", "Desc 0x" + Integer.toHexString(code) + " type=0x" + Integer.toHexString(d.datatype)
+                + " 可写=" + (d.getSet != 0) + " 当前=" + d.curVal
+                + (d.formFlag == 2 ? " 枚举 " + d.enumValues.size() + " 项" : d.formFlag == 1 ? " 范围型" : " 无取值集"));
+        return d;
+    }
+
+    /** 按已知 datatype 读当前属性值 */
+    public PropValue getDevicePropValueTyped(int code, int datatype) throws PtpException {
+        Result r = transact(OP_GET_DEVICE_PROP_VALUE, new int[]{code}, null);
+        PropValue v = new PropValue(datatype);
+        if (PropValue.decodeInto(v, r.data, 0) < 0) throw new PtpException("属性值解码失败 code=0x" + Integer.toHexString(code), -5);
+        return v;
+    }
+
+    /** 写属性（发数据事务）；返回响应码，成功=0x2001。写入后应回读确认（上层做） */
+    public int setDevicePropValue(int code, PropValue v) {
+        long t0 = System.currentTimeMillis();
+        try {
+            transactSendData(OP_SET_DEVICE_PROP_VALUE, new int[]{code}, v.encode());
+            Diag.op("PROP", "Set 0x" + Integer.toHexString(code) + "=" + v + " → rc=0x2001 耗时 "
+                    + (System.currentTimeMillis() - t0) + "ms");
+            return RC_OK;
+        } catch (PtpException e) {
+            Diag.op("PROP", "Set 0x" + Integer.toHexString(code) + "=" + v + " → rc=0x"
+                    + Integer.toHexString(e.responseCode) + " 耗时 " + (System.currentTimeMillis() - t0) + "ms");
+            return e.responseCode;
+        }
+    }
+
+    // ================= v0.2 尼康私有操作 =================
+
+    /** 尼康无数据操作统一封装：逐个记诊断（名称/操作码/响应码/耗时），返回响应码（IO 错误=-1） */
+    private int nikonOp(int op, int[] params, String name) {
+        long t0 = System.currentTimeMillis();
+        try {
+            transact(op, params, null);
+            Diag.op("NIKON", name + "(0x" + Integer.toHexString(op) + ") → rc=0x2001 耗时 "
+                    + (System.currentTimeMillis() - t0) + "ms");
+            return RC_OK;
+        } catch (PtpException e) {
+            Diag.op("NIKON", name + "(0x" + Integer.toHexString(op) + ") → rc=0x"
+                    + Integer.toHexString(e.responseCode) + " 耗时 " + (System.currentTimeMillis() - t0) + "ms");
+            return e.responseCode;
+        }
+    }
+
+    /** 安静版 DeviceReady（不逐次打日志，wait-busy 汇总一行） */
+    private int deviceReadyQuiet() {
+        try { transact(NK_DEVICE_READY, null, null); return RC_OK; }
+        catch (PtpException e) { return e.responseCode; }
+    }
+
+    /** 轮询 DeviceReady(0x90C8) 直到相机不忙（对齐 libgphoto2 library.c nikon_wait_busy：忙=0x2019） */
+    public int nikonWaitBusy(int timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        int rc = RC_DEVICE_BUSY, tries = 0;
+        while (System.currentTimeMillis() - t0 < timeoutMs) {
+            rc = deviceReadyQuiet();
+            tries++;
+            if (rc != RC_DEVICE_BUSY) break;
+            try { Thread.sleep(50); } catch (InterruptedException e) { break; }
+        }
+        Diag.op("NIKON", "WaitBusy 轮询 " + tries + " 次 → rc=0x" + Integer.toHexString(rc)
+                + " 耗时 " + (System.currentTimeMillis() - t0) + "ms");
+        return rc;
+    }
+
+    /**
+     * 开 LiveView：先 ChangeCameraMode(1) 进控制模式（libgphoto2 library.c enable_liveview 前置动作，
+     * 失败只记诊断不中断）→ StartLiveView(0x9201) → WaitBusy(2000ms) 等机身就绪。
+     * 返回判定响应码：OK 或 DeviceBusy（可继续拉帧）视为可往下走，由调用方结合首帧结果决定。
+     */
+    public int nikonStartLiveView() {
+        int cm = nikonOp(NK_CHANGE_CAMERA_MODE, new int[]{1}, "ChangeCameraMode(控制)");
+        if (cm != RC_OK) Diag.op("NIKON", "ChangeCameraMode 未成功（rc=0x" + Integer.toHexString(cm) + "），继续尝试 StartLiveView");
+        int rc = nikonOp(NK_START_LIVE_VIEW, null, "StartLiveView");
+        if (rc == RC_OK || rc == RC_DEVICE_BUSY) {
+            int w = nikonWaitBusy(2000);
+            if (w == RC_OK) return RC_OK;
+            return rc == RC_OK ? w : rc;
+        }
+        return rc;
+    }
+
+    public int nikonEndLiveView() { return nikonOp(NK_END_LIVE_VIEW, null, "EndLiveView"); }
+
+    /** LiveView 一帧：原始数据 + JPEG 切片位置（帧头长度=head jpegOff，真机以此为准） */
+    public static class LiveViewFrame {
+        public byte[] data; public int jpegOff, jpegLen;
+    }
+
+    /**
+     * 拉一帧 LiveView(0x9203)。JPEG 定位方式与 libgphoto2 完全一致：在整帧数据里扫描
+     * SOI(0xFFD8) 起、EOI(0xFFD9) 止（其源码注释自承前置约 128B 帧头未解析 — FIXME）。
+     * 找不到 JPEG 抛 PtpException(-6)；响应码非 OK 由 transact 抛（带 rc）。
+     */
+    public LiveViewFrame nikonGetLiveViewImage() throws PtpException {
+        Result r = transact(NK_GET_LIVE_VIEW_IMG, null, null);
+        byte[] d = r.data;
+        if (d == null || d.length < 4) throw new PtpException("LiveView 帧为空", -6);
+        int soi = -1;
+        for (int i = 0; i + 1 < d.length; i++) {
+            if ((d[i] & 0xFF) == 0xFF && (d[i + 1] & 0xFF) == 0xD8) { soi = i; break; }
+        }
+        if (soi < 0) throw new PtpException("LiveView 帧内未找到 JPEG SOI（帧长 " + d.length + "）", -6);
+        int eoi = -1;
+        for (int i = d.length - 2; i > soi; i--) {
+            if ((d[i] & 0xFF) == 0xFF && (d[i + 1] & 0xFF) == 0xD9) { eoi = i; break; }
+        }
+        LiveViewFrame f = new LiveViewFrame();
+        f.data = d;
+        f.jpegOff = soi;
+        f.jpegLen = (eoi >= 0 ? eoi + 2 : d.length) - soi;
+        return f;
+    }
+
+    /** 点按对焦第 1 步：设 AF 区域（x/y 为 LV 图像像素坐标） */
+    public int nikonChangeAfArea(int x, int y) {
+        return nikonOp(NK_CHANGE_AF_AREA, new int[]{x, y}, "ChangeAfArea(" + x + "," + y + ")");
+    }
+
+    /** 点按对焦第 2 步：驱动 AF（0x90C1）；未合焦相机回 0xA002（library.c config 段实证） */
+    public int nikonAfDrive() { return nikonOp(NK_AF_DRIVE, null, "AfDrive"); }
+
+    public int nikonAfDriveCancel() { return nikonOp(NK_AF_DRIVE_CANCEL, null, "AfDriveCancel"); }
+
+    /**
+     * 遥控拍照（存卡）：InitiateCaptureRecInMedia(0x9207)
+     *  ① 2 参版 (af=0xFFFFFFFE 先 AF, target=0 存卡）— libgphoto2 ptp.h:5139 ptp_nikon_capture2；
+     *  ② 相机回参数不支持(0x2006) 降级 1 参版 (0xFFFFFFFF) — ptp.h:5153（D3x 实证）；
+     *  ③ 再失败降级标准 InitiateCapture(0x100E, storage=0, format=0)。
+     * DeviceBusy 时先 WaitBusy(3000) 再整轮重试一次。返回最终响应码。
+     */
+    public int nikonCapture() {
+        for (int round = 0; round < 2; round++) {
+            int rc = nikonOp(NK_CAPTURE_TO_MEDIA, new int[]{0xFFFFFFFE, 0}, "CaptureRecInMedia(2参)");
+            if (rc == RC_OK) return RC_OK;
+            if (rc == RC_PARAMETER_NOT_SUPPORTED) {
+                rc = nikonOp(NK_CAPTURE_TO_MEDIA, new int[]{0xFFFFFFFF}, "CaptureRecInMedia(1参)");
+                if (rc == RC_OK) return RC_OK;
+            }
+            if (rc == RC_DEVICE_BUSY && round == 0) {
+                nikonWaitBusy(3000);
+                continue;
+            }
+            Diag.op("NIKON", "尼康媒体拍摄未成功（rc=0x" + Integer.toHexString(rc) + "），降级标准 InitiateCapture(0x100E)");
+            return nikonOp(OP_INITIATE_CAPTURE, new int[]{0, 0}, "InitiateCapture(标准)");
+        }
+        return RC_DEVICE_BUSY;
+    }
+
+    public int nikonStartMovieRec() { return nikonOp(NK_START_MOVIE_REC, null, "StartMovieRecInCard"); }
+    public int nikonEndMovieRec() { return nikonOp(NK_END_MOVIE_REC, null, "EndMovieRec"); }
+
     public int[] getStorageIds() throws PtpException {
         Result r = transact(OP_GET_STORAGE_IDS, null, null);
-        transactionId++;
         Cursor c = new Cursor(r.data);
         long n = c.u32();
         int[] ids = new int[(int) n];
@@ -512,7 +912,6 @@ public class PtpIpClient {
 
     public StorageInfo getStorageInfo(int storageId) throws PtpException {
         Result r = transact(OP_GET_STORAGE_INFO, new int[]{storageId}, null);
-        transactionId++;
         Cursor c = new Cursor(r.data);
         c.u16(); c.u16(); c.u16();
         StorageInfo si = new StorageInfo();
@@ -528,7 +927,6 @@ public class PtpIpClient {
 
     public int[] getObjectHandles(int storageId) throws PtpException {
         Result r = transact(OP_GET_OBJECT_HANDLES, new int[]{storageId, 0, 0}, null);
-        transactionId++;
         Cursor c = new Cursor(r.data);
         long n = c.u32();
         int[] hs = new int[(int) n];
@@ -539,7 +937,6 @@ public class PtpIpClient {
 
     public ObjectInfo getObjectInfo(int handle) throws PtpException {
         Result r = transact(OP_GET_OBJECT_INFO, new int[]{handle}, null);
-        transactionId++;
         Cursor c = new Cursor(r.data);
         ObjectInfo oi = new ObjectInfo();
         oi.storageId = c.s32();
@@ -561,7 +958,6 @@ public class PtpIpClient {
 
     public byte[] getThumb(int handle) throws PtpException {
         Result r = transact(OP_GET_THUMB, new int[]{handle}, null);
-        transactionId++;
         return r.data != null ? r.data : new byte[0];
     }
 
@@ -582,7 +978,6 @@ public class PtpIpClient {
                     if (progress != null) progress.onProgress(done[0]);
                 }
             });
-            transactionId++;
             return;
         }
         if (startOffset > 0 && profile != null && !profile.tryPartialObject) {
@@ -607,7 +1002,6 @@ public class PtpIpClient {
                     if (progress != null) progress.onProgress(base + (offSnapshot - base) + got[0]);
                 }
             });
-            transactionId++;
             if (got[0] <= 0) throw new PtpException("GetPartialObject 返回 0 字节 @offset=" + offset, -3);
             offset += got[0];
             Diag.op("PTP", "续传块完成 offset=" + offset + "/" + totalSize);
@@ -702,6 +1096,15 @@ public class PtpIpClient {
             List<Integer> r = new ArrayList<>();
             for (long i = 0; i < n; i++) r.add(u16());
             return r;
+        }
+        int remaining() { return d.length - pos; }
+        /** 按 datatype 解一个属性值并推进游标；失败返回 null */
+        PropValue dpv(int datatype) {
+            PropValue v = new PropValue(datatype);
+            int n = PropValue.decodeInto(v, d, pos);
+            if (n < 0) return null;
+            pos += n;
+            return v;
         }
     }
 }

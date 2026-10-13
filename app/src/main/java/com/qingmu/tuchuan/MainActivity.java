@@ -9,6 +9,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.net.Network;
@@ -16,6 +17,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
@@ -55,8 +57,8 @@ public class MainActivity extends Activity {
     private LinearLayout capsule;
     private ImageView capsuleIcon;
     private TextView capsuleText;
-    private TextView[] tabBtns = new TextView[3];
-    private View[] pages = new View[3];
+    private TextView[] tabBtns = new TextView[4];
+    private View[] pages = new View[4];
 
     // 连接页
     private TextView modeApBtn, modeStaBtn;
@@ -79,6 +81,22 @@ public class MainActivity extends Activity {
     // 诊断页
     private TextView diagTv;
     private ScrollView diagScroll;
+    private CheckBox expCheck;
+
+    // 遥控页（v0.2）
+    private RemoteController remote;
+    private TextView rcStatusTv, rcRemainTv, lvFpsTv, lvStateTv, lastShotTv;
+    private LinearLayout rcPropsBox, rcAdjBox;
+    private FrameLayout lvStage, rcOverlay;
+    private ImageView lvImage, lastShotIv;
+    private HudView hud;
+    private Button lvToggleBtn, captureBtn, movieBtn;
+    private Button lvSizeSmoothBtn, lvSizeClearBtn;
+    private TextView lvNoteTv, lvHintTv, ovTitleTv;
+    private LinearLayout ovList;
+    private CheckBox gridCheck, histCheck;
+    private volatile List<RemoteController.PropItem> propItems = new ArrayList<>();
+    private float pendingAfNx = -1, pendingAfNy = -1;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -87,7 +105,7 @@ public class MainActivity extends Activity {
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.1.1 启动（首测机型 Z fc，其余机型标准协议兼容待验证）");
+        Diag.log("清木图传 v0.2.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证；遥控功能待真机逐项验证）");
         DownloadService.listener = new DownloadService.Listener() {
             @Override public void onJobStart(int index, int total, DownloadService.Job job) {
                 runOnUiThread(() -> {
@@ -118,6 +136,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        teardownRemote();
         Diag.setListener(null);
         DownloadService.listener = null;
         super.onDestroy();
@@ -204,7 +223,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.1.0", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.2.0", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -231,9 +250,9 @@ public class MainActivity extends Activity {
 
         // 页签
         LinearLayout tabs = new LinearLayout(this);
-        int[] tabIcons = {R.drawable.ic_wifi, R.drawable.ic_badge_image, R.drawable.ic_diag};
-        String[] tabNames = {"连接", "照片", "诊断"};
-        for (int i = 0; i < 3; i++) {
+        int[] tabIcons = {R.drawable.ic_wifi, R.drawable.ic_badge_image, R.drawable.ic_remote, R.drawable.ic_diag};
+        String[] tabNames = {"连接", "照片", "遥控", "诊断"};
+        for (int i = 0; i < 4; i++) {
             final int idx = i;
             TextView t = txt(tabNames[i], 14, Ui.TEXT_DIM, true);
             t.setGravity(Gravity.CENTER);
@@ -255,18 +274,23 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         pages[0] = buildConnectPage();
         pages[1] = buildPhotosPage();
-        pages[2] = buildDiagPage();
+        pages[2] = buildRemotePage();
+        pages[3] = buildDiagPage();
         for (View p : pages) frame.addView(p);
         showPage(0);
         setContentView(root);
     }
 
     private void showPage(int idx) {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             pages[i].setVisibility(i == idx ? View.VISIBLE : View.GONE);
             tabBtns[i].setTextColor(i == idx ? Ui.ACCENT : Ui.TEXT_DIM);
             Drawable d = tabBtns[i].getCompoundDrawables()[1];
             if (d != null) d.setTint(i == idx ? Ui.ACCENT : Ui.TEXT_DIM);
+        }
+        // 切离遥控页时停取景，避免后台占用命令通道拖慢图传
+        if (idx != 2 && remote != null && remote.isLiveViewOn()) {
+            remote.stopLiveView();
         }
     }
 
@@ -525,6 +549,19 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "诊断日志已复制", Toast.LENGTH_SHORT).show();
         });
         clearBtn.setOnClickListener(v -> { Diag.clear(); refreshDiag(); });
+        // v0.2 实验开关：非 Z 系机型（profile=BASIC）默认锁定未验证的遥控功能，用户在此手动放行尝试
+        expCheck = new CheckBox(this);
+        expCheck.setText("实验：为非 Z 系机型开启全部遥控功能（LiveView/对焦/录像/参数调节，未验证）");
+        expCheck.setTextColor(Ui.TEXT);
+        expCheck.setTextSize(13);
+        expCheck.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        expCheck.setChecked(prefs.getBoolean("remote_exp", false));
+        expCheck.setOnCheckedChangeListener((b, checked) -> {
+            prefs.edit().putBoolean("remote_exp", checked).apply();
+            if (remote != null) remote.setExperimental(checked);
+            else Diag.op("REMOTE", "实验开关 → " + checked + "（连接相机后生效）");
+        });
+        col.addView(expCheck, wrapMargin(8));
         diagScroll = new ScrollView(this);
         diagScroll.setBackground(getDrawable(R.drawable.bg_card));
         diagTv = txt("", 11, Ui.TEXT_DIM, false);
@@ -542,6 +579,438 @@ public class MainActivity extends Activity {
         diagTv.setText(Diag.getAllText());
         if (diagScroll != null) diagScroll.post(() -> diagScroll.fullScroll(View.FOCUS_DOWN));
     }
+
+    // ================= 遥控页（v0.2） =================
+
+    private Button smallGhostBtn(String label) {
+        Button b = btn(label, 0, false);
+        b.setTextSize(13);
+        b.setPadding(dp(10), dp(6), dp(10), dp(6));
+        return b;
+    }
+
+    private View buildRemotePage() {
+        FrameLayout pageRoot = new FrameLayout(this);
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(col);
+        pageRoot.addView(scroll);
+
+        rcStatusTv = txt("未连接相机（先到「连接」页连接）", 13, Ui.TEXT_DIM, false);
+        col.addView(rcStatusTv, wrapMargin(2));
+
+        // —— 相机状态面板 ——
+        LinearLayout stCard = card();
+        LinearLayout stHead = new LinearLayout(this);
+        stHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView stIc = new ImageView(this);
+        stIc.setImageDrawable(icon(R.drawable.ic_camera, Ui.ACCENT));
+        stHead.addView(stIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView stTitle = txt("相机状态", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        stlp.setMargins(dp(8), 0, 0, 0);
+        stHead.addView(stTitle, stlp);
+        Button refreshBtn = smallGhostBtn("刷新");
+        refreshBtn.setOnClickListener(v -> {
+            if (remote != null) remote.loadProps(AppState.get().storageId);
+            else Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show();
+        });
+        stHead.addView(refreshBtn);
+        stCard.addView(stHead);
+        rcRemainTv = txt("剩余可拍：—", 13, Ui.TEXT, false);
+        stCard.addView(rcRemainTv, wrapMargin(8));
+        rcPropsBox = new LinearLayout(this);
+        rcPropsBox.setOrientation(LinearLayout.VERTICAL);
+        stCard.addView(rcPropsBox, wrapMargin(4));
+        col.addView(stCard);
+
+        // —— 实时取景 ——
+        LinearLayout lvCard = card();
+        LinearLayout lvHead = new LinearLayout(this);
+        lvHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView lvIc = new ImageView(this);
+        lvIc.setImageDrawable(icon(R.drawable.ic_remote, Ui.ACCENT));
+        lvHead.addView(lvIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView lvTitle = txt("实时取景", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams lvtlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        lvtlp.setMargins(dp(8), 0, 0, 0);
+        lvHead.addView(lvTitle, lvtlp);
+        lvStateTv = txt("未开启", 12, Ui.ACCENT, true);
+        lvHead.addView(lvStateTv);
+        lvCard.addView(lvHead);
+
+        lvStage = new FrameLayout(this);
+        lvStage.setBackgroundColor(0xFF050505);
+        lvStage.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(252)));
+        lvImage = new ImageView(this);
+        lvImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        lvStage.addView(lvImage, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        hud = new HudView(this);
+        lvStage.addView(hud, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        lvHintTv = txt("点下方「开启取景」开始监看\n取景中点画面任意位置即点按对焦", 13, Ui.TEXT_DIM, false);
+        lvHintTv.setGravity(Gravity.CENTER);
+        lvStage.addView(lvHintTv, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        lvStage.setOnTouchListener((v, ev) -> {
+            if (ev.getAction() != MotionEvent.ACTION_UP) return true;
+            if (remote == null || !remote.isLiveViewOn()) return true;
+            RectF r = hud.displayRect();
+            float px = ev.getX(), py = ev.getY();
+            if (r.width() <= 0 || px < r.left || px > r.right || py < r.top || py > r.bottom) {
+                rcStatusTv.setText("点在画面外（黑边），已忽略");
+                return true;
+            }
+            float nx = (px - r.left) / r.width();
+            float ny = (py - r.top) / r.height();
+            pendingAfNx = nx; pendingAfNy = ny;
+            hud.showAf(nx, ny, true); // 先显示黄框占位，相机结果回来按成败改色
+            remote.tapFocus(nx, ny);
+            return true;
+        });
+        LinearLayout.LayoutParams stglp = matchWrap(); stglp.setMargins(0, dp(8), 0, 0);
+        lvCard.addView(lvStage, stglp);
+
+        LinearLayout lvOptRow = new LinearLayout(this);
+        lvOptRow.setGravity(Gravity.CENTER_VERTICAL);
+        gridCheck = new CheckBox(this);
+        gridCheck.setText("网格线");
+        gridCheck.setTextColor(Ui.TEXT);
+        gridCheck.setTextSize(13);
+        gridCheck.setChecked(true);
+        gridCheck.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        gridCheck.setOnCheckedChangeListener((b, c) -> hud.setGridOn(c));
+        lvOptRow.addView(gridCheck);
+        histCheck = new CheckBox(this);
+        histCheck.setText("直方图");
+        histCheck.setTextColor(Ui.TEXT);
+        histCheck.setTextSize(13);
+        histCheck.setChecked(true);
+        histCheck.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        histCheck.setOnCheckedChangeListener((b, c) -> {
+            hud.setHistOn(c);
+            if (remote != null) remote.setHistogramEnabled(c);
+        });
+        LinearLayout.LayoutParams hclp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hclp.setMargins(dp(14), 0, 0, 0);
+        lvOptRow.addView(histCheck, hclp);
+        lvCard.addView(lvOptRow, wrapMargin(6));
+
+        // 帧尺寸档：流畅（小帧锁帧率）/ 清晰（大帧看细节）；相机未提供 0xD1AC 时整行置灰
+        LinearLayout sizeRow = new LinearLayout(this);
+        sizeRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView sizeLbl = txt("帧尺寸", 13, Ui.TEXT_DIM, false);
+        sizeRow.addView(sizeLbl);
+        lvSizeSmoothBtn = smallGhostBtn("流畅");
+        lvSizeClearBtn = smallGhostBtn("清晰");
+        LinearLayout.LayoutParams sblp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sblp.setMargins(dp(10), 0, 0, 0);
+        sizeRow.addView(lvSizeSmoothBtn, sblp);
+        LinearLayout.LayoutParams sblp2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sblp2.setMargins(dp(8), 0, 0, 0);
+        sizeRow.addView(lvSizeClearBtn, sblp2);
+        lvSizeSmoothBtn.setOnClickListener(v -> { if (remote != null) remote.setLvSmooth(true); });
+        lvSizeClearBtn.setOnClickListener(v -> { if (remote != null) remote.setLvSmooth(false); });
+        lvCard.addView(sizeRow, wrapMargin(4));
+        lvNoteTv = txt("", 12, Ui.ACCENT, false);
+        lvCard.addView(lvNoteTv, wrapMargin(4));
+
+        lvToggleBtn = btn("开启取景", R.drawable.ic_remote, true);
+        lvToggleBtn.setOnClickListener(v -> {
+            if (remote == null) { Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show(); return; }
+            if (remote.isLiveViewOn()) remote.stopLiveView(); else remote.startLiveView();
+        });
+        lvCard.addView(lvToggleBtn, wrapMargin(8));
+        col.addView(lvCard);
+
+        // —— 拍摄 ——
+        LinearLayout shotCard = card();
+        LinearLayout shotRow = new LinearLayout(this);
+        captureBtn = btn("拍摄", R.drawable.ic_shutter, true);
+        movieBtn = btn("录像", R.drawable.ic_rec, false);
+        shotRow.addView(captureBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout.LayoutParams mvlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        mvlp.setMargins(dp(8), 0, 0, 0);
+        shotRow.addView(movieBtn, mvlp);
+        shotCard.addView(shotRow);
+        shotCard.addView(txt("拍摄后新照片会自动出现在下方「拍完即览」（只拉预览图，原图到照片页下载）。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
+        captureBtn.setOnClickListener(v -> { if (remote != null) remote.capture(); });
+        movieBtn.setOnClickListener(v -> { if (remote != null) remote.toggleMovie(); });
+        col.addView(shotCard);
+
+        // —— 参数调节 ——
+        LinearLayout adjCard = card();
+        LinearLayout adjHead = new LinearLayout(this);
+        adjHead.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView adjIc = new ImageView(this);
+        adjIc.setImageDrawable(icon(R.drawable.ic_settings, Ui.ACCENT));
+        adjHead.addView(adjIc, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView adjTitle = txt("参数调节", 15, Ui.TEXT, true);
+        LinearLayout.LayoutParams adjlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        adjlp.setMargins(dp(8), 0, 0, 0);
+        adjHead.addView(adjTitle, adjlp);
+        adjCard.addView(adjHead);
+        adjCard.addView(txt("选项全部来自相机自报的取值集合，写入后自动回读确认；相机当前模式不允许改的参数会置灰。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
+        rcAdjBox = new LinearLayout(this);
+        rcAdjBox.setOrientation(LinearLayout.VERTICAL);
+        adjCard.addView(rcAdjBox, wrapMargin(4));
+        col.addView(adjCard);
+
+        // —— 拍完即览 ——
+        LinearLayout lastCard = card();
+        TextView lastTitle = txt("拍完即览", 15, Ui.TEXT, true);
+        lastCard.addView(lastTitle);
+        LinearLayout lastRow = new LinearLayout(this);
+        lastRow.setGravity(Gravity.CENTER_VERTICAL);
+        lastShotIv = new ImageView(this);
+        lastShotIv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        lastShotIv.setBackgroundColor(Ui.PANEL_ALT);
+        lastRow.addView(lastShotIv, new LinearLayout.LayoutParams(dp(96), dp(64)));
+        lastShotTv = txt("暂无（遥控拍摄后显示）", 13, Ui.TEXT_DIM, false);
+        LinearLayout.LayoutParams lstlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        lstlp.setMargins(dp(10), 0, 0, 0);
+        lastRow.addView(lastShotTv, lstlp);
+        lastCard.addView(lastRow, wrapMargin(8));
+        col.addView(lastCard);
+
+        // —— 参数选择弹层（自绘深色卡，禁系统灰弹窗） ——
+        rcOverlay = new FrameLayout(this);
+        rcOverlay.setBackgroundColor(0xB3000000);
+        rcOverlay.setVisibility(View.GONE);
+        LinearLayout ovCard = new LinearLayout(this);
+        ovCard.setOrientation(LinearLayout.VERTICAL);
+        ovCard.setBackground(getDrawable(R.drawable.bg_card));
+        ovCard.setPadding(dp(16), dp(14), dp(16), dp(14));
+        FrameLayout.LayoutParams ovlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        ovlp.setMargins(dp(22), 0, dp(22), 0);
+        ovTitleTv = txt("选择", 16, Ui.TEXT, true);
+        ovCard.addView(ovTitleTv);
+        ScrollView ovScroll = new ScrollView(this);
+        ovList = new LinearLayout(this);
+        ovList.setOrientation(LinearLayout.VERTICAL);
+        ovScroll.addView(ovList);
+        ovScroll.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+        ovCard.addView(ovScroll);
+        ovCard.setOnClickListener(v -> { /* 点卡片本身不关闭，拦截冒泡 */ });
+        Button ovClose = btn("取消", 0, false);
+        ovClose.setOnClickListener(v -> rcOverlay.setVisibility(View.GONE));
+        LinearLayout.LayoutParams ovclp = matchWrap(); ovclp.setMargins(0, dp(10), 0, 0);
+        ovCard.addView(ovClose, ovclp);
+        rcOverlay.addView(ovCard, ovlp);
+        rcOverlay.setOnClickListener(v -> rcOverlay.setVisibility(View.GONE));
+        pageRoot.addView(rcOverlay);
+
+        refreshRemoteEnabled();
+        return pageRoot;
+    }
+
+    /** 按连接/门控状态刷新遥控页按钮可用性（未连接一律禁用，功能降级/锁定由 renderProps 与状态文案体现） */
+    private void refreshRemoteEnabled() {
+        boolean conn = AppState.get().sessionReady() && remote != null;
+        if (lvToggleBtn != null) lvToggleBtn.setEnabled(conn);
+        if (captureBtn != null) captureBtn.setEnabled(conn && (remote == null || remote.featureAllowed(RemoteController.F_CAPTURE)));
+        if (movieBtn != null) movieBtn.setEnabled(conn && (remote == null || remote.featureAllowed(RemoteController.F_MOVIE)));
+        if (!conn && rcStatusTv != null && AppState.get().client == null) {
+            rcStatusTv.setText("未连接相机（先到「连接」页连接）");
+        }
+    }
+
+    private void updateLvSizeButtons(List<String> options, int currentIdx, boolean supported) {
+        boolean conn = AppState.get().sessionReady() && remote != null;
+        if (lvSizeSmoothBtn == null) return;
+        lvSizeSmoothBtn.setEnabled(conn && supported && options != null && options.size() > 1);
+        lvSizeClearBtn.setEnabled(conn && supported && options != null && options.size() > 1);
+        if (options != null && options.size() > 1) {
+            lvSizeSmoothBtn.setText("流畅（" + options.get(0) + "）");
+            lvSizeClearBtn.setText("清晰（" + options.get(options.size() - 1) + "）");
+        } else {
+            lvSizeSmoothBtn.setText("流畅");
+            lvSizeClearBtn.setText("清晰");
+        }
+        if (remote != null) lvStateTv.setText(remote.lvSizeLabel());
+    }
+
+    /** 渲染状态面板（只读项）与参数调节区（可调项）；remainText=null 表示不更新剩余张数行 */
+    private void renderProps(String remainText) {
+        if (rcPropsBox == null) return;
+        if (remainText != null) rcRemainTv.setText("剩余可拍：" + remainText);
+        rcPropsBox.removeAllViews();
+        rcAdjBox.removeAllViews();
+        boolean writeAllowed = remote != null && remote.featureAllowed(RemoteController.F_PROPS_WRITE);
+        for (RemoteController.PropItem it : propItems) {
+            // 只读展示行
+            LinearLayout row = new LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            TextView name = txt(it.def.name, 13, Ui.TEXT, false);
+            row.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            TextView val = txt(it.available() ? it.currentText() : "—（相机未提供）",
+                    13, it.available() ? Ui.TEXT : Ui.TEXT_DIM, true);
+            row.addView(val);
+            rcPropsBox.addView(row, wrapMargin(3));
+            // 调节行
+            if (it.def.adjustable) {
+                LinearLayout arow = new LinearLayout(this);
+                arow.setGravity(Gravity.CENTER_VERTICAL);
+                TextView an = txt(it.def.name, 14, Ui.TEXT, false);
+                arow.addView(an, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                TextView av = txt(it.available() ? it.currentText() : "—",
+                        14, it.available() ? Ui.ACCENT : Ui.TEXT_DIM, true);
+                arow.addView(av);
+                Button adj = smallGhostBtn("调整");
+                String why = null;
+                if (!it.available()) why = "相机未提供该属性";
+                else if (!it.canWrite()) why = "相机报告不可写/无取值集（当前模式可能受限）";
+                else if (!writeAllowed) why = "当前机型未验证，诊断页开实验开关后可调";
+                adj.setEnabled(why == null);
+                if (why != null) {
+                    TextView wt = txt(why, 11, Ui.TEXT_DIM, false);
+                    LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    wlp.setMargins(dp(8), 0, 0, 0);
+                    arow.addView(wt, wlp);
+                } else {
+                    LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    alp.setMargins(dp(8), 0, 0, 0);
+                    arow.addView(adj, alp);
+                    final RemoteController.PropItem fit = it;
+                    adj.setOnClickListener(v -> showPropPicker(fit));
+                }
+                rcAdjBox.addView(arow, wrapMargin(6));
+            }
+        }
+        refreshRemoteEnabled();
+    }
+
+    /** 参数选择弹层：选项严格来自相机 desc（枚举原样列全；范围型按步进生成并封顶） */
+    private void showPropPicker(final RemoteController.PropItem item) {
+        PtpIpClient.DevicePropDesc d = item.desc;
+        if (d == null) return;
+        ovList.removeAllViews();
+        ovTitleTv.setText("选择" + item.def.name + "（当前 " + item.currentText() + "）");
+        List<PtpIpClient.PropValue> opts = new ArrayList<>();
+        if (d.formFlag == 2) {
+            opts.addAll(d.enumValues);
+        } else if (d.formFlag == 1 && d.rangeMin != null && d.rangeMax != null && d.rangeStep != null) {
+            long min = d.rangeMin.num, max = d.rangeMax.num, step = d.rangeStep.num;
+            if (step <= 0) step = 1;
+            if ((max - min) / step > 60) step = Math.max(step, (max - min) / 60); // 封顶 60 项防弹层过长
+            for (long v = min; v <= max; v += step) opts.add(new PtpIpClient.PropValue(d.datatype, v));
+        }
+        if (opts.isEmpty()) {
+            ovList.addView(txt("相机未给出可选值集合，无法调节。", 13, Ui.TEXT_DIM, false), wrapMargin(8));
+        }
+        for (final PtpIpClient.PropValue pv : opts) {
+            boolean cur = d.curVal != null && pv.datatype == PtpIpClient.DTC_STR
+                    ? String.valueOf(pv.str).equals(String.valueOf(d.curVal.str))
+                    : d.curVal != null && pv.num == d.curVal.num;
+            Button b = btn(CamProps.format(item.def.code, pv) + (cur ? "（当前）" : ""), 0, cur);
+            b.setOnClickListener(v -> {
+                rcOverlay.setVisibility(View.GONE);
+                if (remote != null) remote.setProp(item, pv);
+            });
+            LinearLayout.LayoutParams blp = matchWrap(); blp.setMargins(0, dp(6), 0, 0);
+            ovList.addView(b, blp);
+        }
+        rcOverlay.setVisibility(View.VISIBLE);
+    }
+
+    private final RemoteController.Ui remoteUi = new RemoteController.Ui() {
+        @Override public void onProps(List<RemoteController.PropItem> items, String remainText) {
+            propItems = items;
+            runOnUiThread(() -> renderProps(remainText));
+        }
+        @Override public void onPropUpdated(RemoteController.PropItem item, boolean ok, String msg) {
+            runOnUiThread(() -> {
+                rcStatusTv.setText(item.def.name + "：" + msg);
+                renderProps(null); // desc 已被中枢回读更新，原样重渲染
+            });
+        }
+        @Override public void onFrame(Bitmap bmp, float fps) {
+            if (pages[2].getVisibility() != View.VISIBLE) return; // 不在遥控页不做 UI 工作
+            runOnUiThread(() -> {
+                lvImage.setImageBitmap(bmp);
+                hud.setFrameSize(bmp.getWidth(), bmp.getHeight());
+                if (lvHintTv.getVisibility() == View.VISIBLE) lvHintTv.setVisibility(View.GONE);
+            });
+        }
+        @Override public void onHistogram(float[][] bins) {
+            runOnUiThread(() -> hud.setHistogram(bins));
+        }
+        @Override public void onStatus(String msg) {
+            runOnUiThread(() -> rcStatusTv.setText(msg));
+        }
+        @Override public void onAfResult(boolean ok, String msg) {
+            runOnUiThread(() -> {
+                rcStatusTv.setText(msg);
+                if (pendingAfNx >= 0) hud.showAf(pendingAfNx, pendingAfNy, ok);
+            });
+        }
+        @Override public void onNewPhoto(int handle, Bitmap thumb, String filename) {
+            runOnUiThread(() -> {
+                if (thumb != null) lastShotIv.setImageBitmap(thumb);
+                lastShotTv.setText(filename + "（预览；原图在照片页下载）");
+            });
+        }
+        @Override public void onMovie(boolean recording) {
+            runOnUiThread(() -> {
+                movieBtn.setText(recording ? "停止录像" : "录像");
+                Drawable d = icon(recording ? R.drawable.ic_stop : R.drawable.ic_rec, Ui.ERR);
+                int s = dp(19);
+                d.setBounds(0, 0, s, s);
+                movieBtn.setCompoundDrawables(d, null, null, null);
+            });
+        }
+        @Override public void onLiveView(boolean on, String msg) {
+            runOnUiThread(() -> {
+                lvToggleBtn.setText(on ? "关闭取景" : "开启取景");
+                if (!on) {
+                    lvStateTv.setText("未开启");
+                    lvHintTv.setVisibility(View.VISIBLE);
+                }
+                rcStatusTv.setText(msg);
+            });
+        }
+        @Override public void onFeatureStateChanged() {
+            runOnUiThread(() -> { refreshRemoteEnabled(); renderProps(null); });
+        }
+        @Override public void onLvState(String sizeLabel, int targetFps, float displayFps, String note) {
+            runOnUiThread(() -> {
+                lvStateTv.setText(sizeLabel + " · " + String.format("%.0f", displayFps) + "fps");
+                if (note != null) lvNoteTv.setText(note);
+            });
+        }
+        @Override public void onLvSizes(List<String> options, int currentIdx, boolean supported) {
+            runOnUiThread(() -> updateLvSizeButtons(options, currentIdx, supported));
+        }
+    };
+
+    /** 断开/换连时拆遥控中枢（停取景与录像，摘事件监听）；图传主链路不受影响 */
+    private void teardownRemote() {
+        if (remote != null) {
+            try { remote.shutdown(); } catch (Exception ignore) {}
+            remote = null;
+        }
+        runOnUiThread(() -> {
+            propItems = new ArrayList<>();
+            if (rcPropsBox != null) { rcPropsBox.removeAllViews(); rcAdjBox.removeAllViews(); }
+            if (rcRemainTv != null) rcRemainTv.setText("剩余可拍：—");
+            if (rcStatusTv != null) rcStatusTv.setText("未连接相机（先到「连接」页连接）");
+            if (lvToggleBtn != null) lvToggleBtn.setText("开启取景");
+            if (lvStateTv != null) lvStateTv.setText("未开启");
+            if (lvNoteTv != null) lvNoteTv.setText("");
+            refreshRemoteEnabled();
+        });
+    }
+
 
     // ================= 连接流程 =================
 
@@ -638,6 +1107,7 @@ public class MainActivity extends Activity {
             client.setConnectionListener(reason -> {
                 setCapsule(false, "连接已断开");
                 setStatus("连接断开：" + reason + "（下载中会自动重连）", Ui.ERR);
+                teardownRemote();
             });
             setStatus("PTP/IP 握手中…", Ui.TEXT_DIM);
             client.connect(network, host, port);
@@ -666,6 +1136,20 @@ public class MainActivity extends Activity {
                 profileTv.setText("机型 profile：" + profile.id + "（" + profile.note + "）");
             });
             setCapsule(true, "已连接 · " + (client.getCameraName().isEmpty() ? model : client.getCameraName()));
+            // v0.2：装配遥控中枢（查帧尺寸档、自动读一次状态面板）；失败只记诊断，不影响图传主链路
+            try {
+                teardownRemote();
+                remote = new RemoteController(client, profile, prefs.getBoolean("remote_exp", false), remoteUi);
+                remote.setStorageId(st.storageId);
+                remote.queryLvSize();
+                remote.loadProps(st.storageId);
+                runOnUiThread(() -> {
+                    rcStatusTv.setText("已连接 · " + model + "（遥控功能待真机逐项验证）");
+                    refreshRemoteEnabled();
+                });
+            } catch (Exception e) {
+                Diag.op("REMOTE", "遥控中枢装配失败（图传不受影响）：" + e.getMessage());
+            }
             if (!client.isEventChannelOk()) {
                 setStatus("已连接（功能受限：事件通道未建立，纯命令通道模式）", Ui.ACCENT);
             } else {
@@ -680,6 +1164,7 @@ public class MainActivity extends Activity {
 
     private void onDisconnectClicked() {
         bg.execute(() -> {
+            teardownRemote();
             AppState st = AppState.get();
             if (st.client != null) { try { st.client.disconnect(); } catch (Exception ignore) {} st.client = null; }
             st.wifi.disconnect();

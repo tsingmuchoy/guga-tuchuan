@@ -20,51 +20,61 @@ public final class CameraProfile {
         PLACEHOLDER_ONCE
     }
 
+    /**
+     * v0.2 遥控等级：
+     *  FULL —— 状态面板 + LiveView + 点按对焦 + 快门 + 录像 + 参数调节全开尝试（Z 系）。
+     *  BASIC —— 默认仅状态面板（只读）+ 遥控快门；其余遥控功能标注「未验证」，
+     *           用户在诊断页开「实验开关」后才放行尝试（老单反/WU/Coolpix/未知机型）。
+     * 任一遥控操作失败只降级该功能本身，不影响图传主链路。
+     */
+    public enum RemoteLevel { FULL, BASIC }
+
     public final String id;
     public final boolean tryPartialObject;
     public final boolean eventReliable;
     public final ThumbFallback thumbFallback;
+    public final RemoteLevel remote;
     public final String note;
 
-    private CameraProfile(String id, boolean partial, boolean evt, ThumbFallback tf, String note) {
+    private CameraProfile(String id, boolean partial, boolean evt, ThumbFallback tf, RemoteLevel remote, String note) {
         this.id = id; this.tryPartialObject = partial; this.eventReliable = evt;
-        this.thumbFallback = tf; this.note = note;
+        this.thumbFallback = tf; this.remote = remote; this.note = note;
     }
 
     public static final CameraProfile DEFAULT = new CameraProfile(
-            "DEFAULT", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "DEFAULT", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.BASIC,
             "标准 PTP/IP 默认档：未知机型按规范直连，行为以真机日志为准");
 
     public static final CameraProfile Z_FC = new CameraProfile(
-            "Z_FC", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "Z_FC", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
             "首测机型。相机 AP「建立 Wi-Fi 连接」或「连接至 PC」均可；联调时先强停 SnapBridge 防抢连");
 
     public static final CameraProfile Z_50_30 = new CameraProfile(
-            "Z_50_30", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "Z_50_30", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
             "Z 50/Z 30 等与 Z fc 同代机型，入口相同，标准协议兼容、待真机验证");
 
     public static final CameraProfile Z_FULLFRAME = new CameraProfile(
-            "Z_FULLFRAME", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "Z_FULLFRAME", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
             "Z 5/Z 6/Z 7（含 II 代）与 Z 8/Z 9：PTP/IP 成熟，标准协议兼容、待真机验证");
 
     public static final CameraProfile Z_GENERIC = new CameraProfile(
-            "Z_GENERIC", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "Z_GENERIC", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
             "Z 系列通用档（Z f、Z 50II、Z 6III、Z R 等）：菜单多在「网络菜单」，标准协议兼容、待真机验证");
 
     public static final CameraProfile DSLR_850_780 = new CameraProfile(
-            "DSLR_WIFI_850_780", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "DSLR_WIFI_850_780", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.BASIC,
             "D850/D780 内置 Wi-Fi：「连接至智能设备」或「连接至 PC」入口，标准协议兼容、待真机验证");
 
     public static final CameraProfile DSLR_MID = new CameraProfile(
-            "DSLR_WIFI_MID", true, true, ThumbFallback.PLACEHOLDER_RETRY,
+            "DSLR_WIFI_MID", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.BASIC,
             "D7500/D500/D750/D7200 等内置 Wi-Fi 单反：相机作 AP（192.168.1.1:15740）；D750 Wi-Fi 较弱、距离敏感");
 
     public static final CameraProfile WU_ADAPTER = new CameraProfile(
-            "WU_ADAPTER", false, false, ThumbFallback.PLACEHOLDER_ONCE,
+            "WU_ADAPTER", false, false, ThumbFallback.PLACEHOLDER_ONCE, RemoteLevel.BASIC,
             "经 WU-1a/1b 无线适配器：带宽低、事件通道不可靠，禁用 PartialObject 整文件传，缩略图只试一次");
 
     public static final CameraProfile COOLPIX_WIFI = new CameraProfile(
-            "COOLPIX_WIFI", true, false, ThumbFallback.PLACEHOLDER_RETRY,
+            "COOLPIX_WIFI", true, false, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.BASIC,
             "Coolpix Wi-Fi 机型：PTP/IP 实现较简，事件通道按不可靠处理，标准协议兼容、待真机验证");
 
     /** 按 Model 匹配；wuHint=true（用户勾选经 WU 适配器）时无条件优先 WU 档 */
