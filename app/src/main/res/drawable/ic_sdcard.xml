@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- SD 卡：缺口卡身 + 金手指触点 -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M7,3 L16,3 L20,7 L20,19.5 A1.5,1.5 0 0 1 18.5,21 L7,21 A1.5,1.5 0 0 1 5.5,19.5 L5.5,4.5 A1.5,1.5 0 0 1 7,3 Z M8.5,5.5 L8.5,9.5 L10.5,9.5 L10.5,5.5 Z M12,5.5 L12,9.5 L14,9.5 L14,5.5 Z M8,12.5 L17,12.5 L17,18.5 L8,18.5 Z"/>
+</vector>

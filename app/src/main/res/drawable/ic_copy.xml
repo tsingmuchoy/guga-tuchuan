@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 复制：前后交叠的两个方框（诊断页一键复制） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M8.5,8.5 L17.5,8.5 A1.5,1.5 0 0 1 19,10 L19,19 A1.5,1.5 0 0 1 17.5,20.5 L8.5,20.5 A1.5,1.5 0 0 1 7,19 L7,10 A1.5,1.5 0 0 1 8.5,8.5 Z M9,10 L9,19 L17.5,19 L17.5,10 Z M15.5,7 L6.5,7 A1.5,1.5 0 0 0 5,8.5 L5,15 L3.5,15 L3.5,6 A2.5,2.5 0 0 1 6,3.5 L15.5,3.5 Z"/>
+</vector>

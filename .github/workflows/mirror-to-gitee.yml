@@ -1,0 +1,89 @@
+name: Mirror to Gitee
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  GITEE_USER: tsingmuchoy
+  GITEE_REPO: guga-tuchuan
+
+jobs:
+  mirror-git:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push branches and tags to Gitee
+        env:
+          TK: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          git remote add gitee "https://tsingmuchoy:${TK}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
+          git config http.postBuffer 524288000
+          ok=0
+          for i in 1 2 3 4; do
+            if git -c http.version=HTTP/1.1 push gitee --all && git -c http.version=HTTP/1.1 push gitee --tags --force; then ok=1; echo "push ok (attempt $i)"; break; fi
+            echo "push attempt $i failed, retry in 20s"; sleep 20
+          done
+          [ "$ok" = "1" ] || exit 1
+
+  mirror-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    env:
+      TK: ${{ secrets.GITEE_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Create Gitee release and upload assets
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          NAME: ${{ github.event.release.name }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          # Gitee 接口在负载高时会返回 null/空响应：创建与查询都带重试，
+          # 解析做空值兜底，拿不到发行版 id 就明确失败（旧版直接 .get 崩在 null 上）
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/rel.json -w '%{http_code}' -X POST "https://gitee.com/api/v5/repos/${GITEE_USER}/${GITEE_REPO}/releases" \
+              --data-urlencode "access_token=${TK}" \
+              --data-urlencode "tag_name=${TAG}" \
+              --data-urlencode "name=${NAME}" \
+              --data-urlencode "body=${BODY}" \
+              --data-urlencode "target_commitish=main" || echo 000)
+            echo "create attempt $i http=$code"
+            [ "$code" = "201" ] && break
+            sleep 15
+          done
+          ID=""
+          for i in 1 2 3 4 5 6; do
+            ID=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_USER}/${GITEE_REPO}/releases/tags/${TAG}?access_token=${TK}" | python3 -c "import json,sys
+          try:
+            d=json.load(sys.stdin)
+            print((d or {}).get('id','') if isinstance(d,dict) else '')
+          except Exception:
+            print('')")
+            [ -n "$ID" ] && break
+            echo "release not visible yet (attempt $i), wait 15s"
+            sleep 15
+          done
+          echo "gitee release id: $ID"
+          [ -n "$ID" ] || { echo "FAILED: no gitee release id"; exit 1; }
+          mkdir -p /tmp/assets
+          gh release download "$TAG" --repo "${{ github.repository }}" --dir /tmp/assets || true
+          for f in /tmp/assets/*; do
+            [ -f "$f" ] || continue
+            ok=0
+            for i in 1 2 3; do
+              resp=$(curl -s --connect-timeout 20 --max-time 120 -X POST "https://gitee.com/api/v5/repos/${GITEE_USER}/${GITEE_REPO}/releases/${ID}/attach_files" \
+                -F "access_token=${TK}" -F "file=@${f}" || true)
+              echo "$resp" | head -c 200; echo
+              if echo "$resp" | grep -q '"id"'; then ok=1; break; fi
+              echo "upload attempt $i failed, retry in 15s"
+              sleep 15
+            done
+            [ "$ok" = "1" ] || { echo "FAILED uploading $f"; exit 1; }
+          done

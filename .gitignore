@@ -1,0 +1,9 @@
+build-manual/*.apk
+build-manual/compiled.zip
+build-manual/classes/
+build-manual/dex/
+build-manual/gen/
+build-manual/*.log
+build-manual/sources.txt
+*.apk
+*.apk.idsig

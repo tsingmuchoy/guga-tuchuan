@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 相机：机身 + 镜头（单色填充，靠 tint 着色） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M4,7 L7.5,7 L9,4.5 L15,4.5 L16.5,7 L20,7 A1.5,1.5 0 0 1 21.5,8.5 L21.5,17.5 A1.5,1.5 0 0 1 20,19 L4,19 A1.5,1.5 0 0 1 2.5,17.5 L2.5,8.5 A1.5,1.5 0 0 1 4,7 Z M12,9 a4,4 0 1 0 0.01,0 Z M12,10.8 a2.2,2.2 0 1 1 -0.01,0 Z"/>
+</vector>
