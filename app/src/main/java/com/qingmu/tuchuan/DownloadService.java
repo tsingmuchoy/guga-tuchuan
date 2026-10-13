@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *  1) .part 存在 → GetPartialObject 从 .part 长度续传（profile 禁用 Partial 时直接走 3）
  *  2) Partial 相机报错（响应码非 OK）→ 删 .part，整文件 GetObject 重下一次
  *  3) IO 断裂 → PtpIpClient.reconnect() 指数退避重连+重建会话，成功则从 .part 继续（最多 4 轮）
- * 成品先落在 App 专属目录，校验长度后经 MediaStore 发布到 Pictures/GugaTuchuan 并登记防重复。
+ * 成品先落在 App 专属目录，校验长度后经 MediaStore 发布到 Pictures/QingmuTuchuan 并登记防重复。
  */
 public class DownloadService extends Service {
 
@@ -75,7 +75,7 @@ public class DownloadService extends Service {
         if (Build.VERSION.SDK_INT >= 26 && nm != null) {
             nm.createNotificationChannel(new NotificationChannel(CHANNEL, "图传下载", NotificationManager.IMPORTANCE_LOW));
         }
-        startForeground(NOTIF_ID, buildNotif("咕嘎图传", "准备下载…", -1));
+        startForeground(NOTIF_ID, buildNotif("清木图传", "准备下载…", -1));
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -99,7 +99,7 @@ public class DownloadService extends Service {
 
     private void notifyProgress(String text, int percent) {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        if (nm != null) nm.notify(NOTIF_ID, buildNotif("咕嘎图传 · 下载中", text, percent));
+        if (nm != null) nm.notify(NOTIF_ID, buildNotif("清木图传 · 下载中", text, percent));
     }
 
     private void workLoop() {
@@ -224,7 +224,7 @@ public class DownloadService extends Service {
         fin.delete();
         done.add(job.filename);
         prefs.edit().putStringSet("done_files", done).apply();
-        Diag.op("DL", "完成并已存入相册 Pictures/GugaTuchuan/" + job.filename);
+        Diag.op("DL", "完成并已存入相册 Pictures/QingmuTuchuan/" + job.filename);
     }
 
     private void publishToGallery(File src, String filename) throws Exception {
@@ -233,7 +233,7 @@ public class DownloadService extends Service {
             ContentValues v = new ContentValues();
             v.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
             v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-            v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/GugaTuchuan");
+            v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/QingmuTuchuan");
             v.put(MediaStore.MediaColumns.IS_PENDING, 1);
             Uri uri = getContentResolver().insert(MediaStore.Files.getContentUri("external"), v);
             if (uri == null) throw new Exception("MediaStore insert 失败");
@@ -247,7 +247,7 @@ public class DownloadService extends Service {
             getContentResolver().update(uri, v, null, null);
         } else {
             File destDir = new File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_PICTURES), "GugaTuchuan");
+                    Environment.DIRECTORY_PICTURES), "QingmuTuchuan");
             //noinspection ResultOfMethodCallIgnored
             destDir.mkdirs();
             File dest = new File(destDir, filename);

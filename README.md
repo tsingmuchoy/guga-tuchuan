@@ -1,4 +1,4 @@
-# 咕嘎图传 Guga Tuchuan 📷🐧
+# 清木图传 Qingmu Tuchuan 📷🐧
 
 一款直连尼康相机的安卓 Wi-Fi 图传 App：不走 SnapBridge，直接用标准 PTP/IP 协议连相机，
 看缩略图墙、批量下载 JPEG + NEF 原图，带断点续传、断线自动重连和全程连接诊断。
@@ -13,9 +13,9 @@
 - ✅ **多选批量下载**：勾选后显示已选数量与总大小估算，队列顺序下载、逐个进度 + 总进度
 - ⏩ **断点续传**：GetPartialObject 按偏移续传；相机不支持时自动降级整文件重下
 - 🔁 **断线自动重连**：指数退避重连 + 会话重建，下载队列从 .part 偏移继续
-- 💾 **存入相册**：成品经 MediaStore 存到 Pictures/GugaTuchuan，已传文件自动登记防重复下载
+- 💾 **存入相册**：成品经 MediaStore 存到 Pictures/QingmuTuchuan，已传文件自动登记防重复下载
 - 🩺 **连接诊断**：协议每个关键节点（握手、操作码/响应码、命中机型 profile、重连、续传偏移）全打日志，诊断页可一键复制
-- 🎨 **尼康黄黑风 UI**：纯黑底 + 尼康黄主色；全部图标（含启动器图标小咕嘎抱相机）均为手写 VectorDrawable，零位图
+- 🎨 **尼康黄黑风 UI**：纯黑底 + 尼康黄主色；全部图标均为 VectorDrawable，零位图（启动器图标为点阵相机：白点阵机身轮廓 + 黄点阵镜头）
 
 ## 📱 兼容机型与物理限制
 
@@ -27,16 +27,16 @@
 ## 🚀 连接使用步骤
 
 1. 相机上开启 Wi-Fi：选「建立 Wi-Fi 连接」（相机当热点）或「连接至 PC」（相机加入你家局域网）。
-2. 打开咕嘎图传「连接」页：AP 模式填相机屏幕显示的 SSID/密码点连接；STA 模式填相机在局域网里的 IP（端口默认 15740）。
+2. 打开清木图传「连接」页：AP 模式填相机屏幕显示的 SSID/密码点连接；STA 模式填相机在局域网里的 IP（端口默认 15740）。
 3. 连上后进「照片」页，缩略图会自动加载；勾选要传的照片，点底部下载。
-4. 下载在前台服务里跑，成品进系统相册 Pictures/GugaTuchuan；传一半断线会自动重连续传。
+4. 下载在前台服务里跑，成品进系统相册 Pictures/QingmuTuchuan；传一半断线会自动重连续传。
 5. 连不上或传不动时，去「诊断」页把日志复制出来——响应码和失败阶段都写在里面。
 
 > 小提示：联调/使用前建议先强停 SnapBridge，它会在后台抢占相机的 PTP 会话。
 
 ## 📦 安装
 
-到本仓库的 **Releases** 下载最新 APK 直接安装（安卓 8.0+）。当前最新版 v0.1.0。
+到本仓库的 **Releases** 下载最新 APK 直接安装（安卓 8.0+）。当前最新版 v0.1.1。
 
 ## ✍️ 作者
 
@@ -48,6 +48,11 @@
 
 [MIT](LICENSE)
 
+## 📝 更新日志
+
+- **v0.1.1（2026-10-13）**：软件更名为「清木图传」（原名咕嘎图传），包名改为 com.qingmu.tuchuan；启动器图标更换为简约点阵相机；功能与 v0.1.0 完全一致。
+- **v0.1.0（2026-10-13）**：首个版本。PTP/IP 双入口连接、缩略图墙、批量下载 + 断点续传 + 自动重连、连接诊断、多机型 profile。
+
 ---
 
 以下为工程与协议技术细节。
@@ -57,7 +62,7 @@
 - 目录仿咕嘎音乐：源码 `app/src/main`，手动管线 `build-manual/build.sh <code> <name>`
   （aapt2 → javac -source 8 → d8 → zipalign → apksigner，调试签名与咕嘎音乐同一把）。
 - 框架-only：纯 Java + Android framework API，零 AndroidX、零第三方库。
-- 产物：`guga-tuchuan-v0.1.0.apk`（67,750 字节，minSdk 26 / targetSdk 34）。
+- 产物：`qingmu-tuchuan-v0.1.1.apk`（67,750 字节，minSdk 26 / targetSdk 34）。
 - UI：B 尼康黄黑风（纯黑 #000 + 尼康黄 #FFDE00），颜色集中在 `Ui.java` + themes.xml；
   图标全量 VectorDrawable（清单见文末），无 PNG、无 emoji 图标。
 
@@ -69,14 +74,14 @@
 | `CameraProfile.java` | 机型 profile 表（Model 包含匹配）：DEFAULT / Z_FC / Z_50_30 / Z_FULLFRAME / Z_GENERIC / DSLR_WIFI_850_780 / DSLR_WIFI_MID / WU_ADAPTER / COOLPIX_WIFI |
 | `CameraWifi.java` | 入口①相机 AP：WifiNetworkSpecifier（API29+），bindProcessToNetwork + Network SocketFactory 双保险；低版本手动连热点兜底 |
 | `ThumbCache.java` | 缩略图三级缓存：内存 LruCache 24MB → 磁盘（可关）→ GetThumb 懒加载；失败按 profile 降级 |
-| `DownloadService.java` | 前台 Service 下载队列：.part 续传 → Partial 报错整传降级 → IO 断线重连续传（≤4 轮）；MediaStore 发布 Pictures/GugaTuchuan + 已传登记防重复 |
+| `DownloadService.java` | 前台 Service 下载队列：.part 续传 → Partial 报错整传降级 → IO 断线重连续传（≤4 轮）；MediaStore 发布 Pictures/QingmuTuchuan + 已传登记防重复 |
 | `MainActivity.java` | 三页 UI：连接（双入口+设备卡+兼容性说明）/ 照片（网格多选+进度）/ 诊断（300 行日志+复制） |
 | `Diag.java` | 全局诊断日志（环形 300 行），协议每个关键节点必打：握手阶段、操作码/响应码、PROFILE 命中、重连次数、续传偏移 |
 
 ## 协议要点（libgphoto2 ptpip.c 实证）
 
 - 包头：uint32 小端总长 + uint32 类型。命令通道 InitCommandRequest(1)→Ack(2)，
-  负载含 16B initiator GUID + UTF-16LE 名 "GugaTuchuan" + 版本 0x00010000；
+  负载含 16B initiator GUID + UTF-16LE 名 "QingmuTuchuan" + 版本 0x00010000；
   Ack 负载 = connection number(4B) + 相机 GUID(16B) + 相机名(UTF-16LE)。
 - 事件通道 InitEventRequest(3) 带 connection number → Ack(4)；建不起来只降级纯命令通道，不判连接失败。
 - OperationRequest 负载：DataPhaseInfo(4B，收数据/无数据=1，发数据=2) + 操作码(2B) + 事务ID(4B) + 参数。
@@ -131,7 +136,7 @@
 
 ## 矢量图标清单（res/drawable，全部 <vector> 手写 pathData）
 
-- ic_launcher_foreground.xml — 启动器 adaptive icon 前景（定稿：小咕嘎抱复古相机——黄渔夫帽+帽顶揪揪、棕刘海、闭眼笑脸粉腮红、奶油围巾爱心+爪印、黑身白肚皮细灰描边、橙脚、银顶黑身相机，纯黑底由 ic_launcher_background 提供）
+- ic_launcher_foreground.xml — 启动器 adaptive icon 前景（定稿：点阵相机——30×30 统一栅格圆点阵，白点勾勒机身双线轮廓、黄点实心镜头盘+白点外环、右上黄点方块、机顶黄点簇，纯黑底由 ic_launcher_background 提供；由 `tools/gen_launcher_icon.py` 生成，白点 213 + 黄点 64 合并为 2 条 path）
 - ic_camera.xml — 相机（标题/设备卡）
 - ic_wifi.xml — Wi-Fi/连接（胶囊/页签/连接按钮）
 - ic_battery.xml — 电池（设备卡）

@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 import android.net.Network;
 
@@ -128,7 +128,7 @@ public class PtpIpClient {
     public PtpIpClient(byte[] initiatorGuid, String initiatorName) {
         this.initiatorGuid = initiatorGuid != null && initiatorGuid.length == 16
                 ? initiatorGuid.clone() : new byte[16];
-        this.initiatorName = initiatorName != null ? initiatorName : "GugaTuchuan";
+        this.initiatorName = initiatorName != null ? initiatorName : "QingmuTuchuan";
     }
 
     public void setConnectionListener(ConnectionListener l) { connListener = l; }

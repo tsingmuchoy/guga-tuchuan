@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 import android.graphics.Color;
 

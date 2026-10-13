@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 /** 照片墙条目（由 GetObjectInfo 填充） */
 public class PhotoItem {

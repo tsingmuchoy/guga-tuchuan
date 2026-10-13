@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 /**
  * 机型 profile 表（集中一处，按 GetDeviceInfo 的 Model 字符串包含匹配）。

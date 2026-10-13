@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 import android.content.Context;
 import android.graphics.Bitmap;

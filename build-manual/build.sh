@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 咕嘎图传 手动打包管线（仿咕嘎音乐 build-manual/build.sh 改路径与产物名）
+# 清木图传 手动打包管线（仿咕嘎音乐 build-manual/build.sh 改路径与产物名）
 set -e
 VER_CODE="${1:?need version code}"
 VER_NAME="${2:?need version name}"
@@ -21,7 +21,7 @@ javac -source 8 -target 8 -g:none -encoding UTF-8 -cp "$AJ" -d "$OUT/classes" @"
 cp "$OUT/app-unsigned.apk" "$OUT/app-with-dex.apk"
 (cd "$OUT" && zip -9 -j app-with-dex.apk dex/classes.dex > /dev/null)
 "$BT/zipalign" -p -f 4 "$OUT/app-with-dex.apk" "$OUT/app-aligned.apk"
-APK="$HOME/workspace/nikon-transfer/guga-tuchuan-v$VER_NAME.apk"
+APK="$HOME/workspace/nikon-transfer/qingmu-tuchuan-v$VER_NAME.apk"
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$APK" "$OUT/app-aligned.apk"
 echo "BUILD_DONE v$VER_NAME (code $VER_CODE)"
 "$BT/apksigner" verify --print-certs "$APK" | grep "SHA-256"

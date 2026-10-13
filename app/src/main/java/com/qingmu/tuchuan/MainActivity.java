@@ -1,4 +1,4 @@
-package com.guga.tuchuan;
+package com.qingmu.tuchuan;
 
 import android.Manifest;
 import android.app.Activity;
@@ -40,7 +40,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 咕嘎图传主界面（单 Activity 三页：连接 / 照片 / 诊断）。
+ * 清木图传主界面（单 Activity 三页：连接 / 照片 / 诊断）。
  * 风格：B 尼康黄黑风 —— 纯黑底、尼康黄强调、黄边胶囊连接状态条；颜色全走 Ui 常量。
  * 图标：全部 VectorDrawable（R.drawable.ic_*），禁止 emoji/字符充数。
  * 连接双入口：①相机 AP（WifiNetworkSpecifier + 192.168.1.1）②「连接至 PC」/STA（手动 IP+端口）。
@@ -87,7 +87,7 @@ public class MainActivity extends Activity {
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("咕嘎图传 v0.1.0 启动（首测机型 Z fc，其余机型标准协议兼容待验证）");
+        Diag.log("清木图传 v0.1.1 启动（首测机型 Z fc，其余机型标准协议兼容待验证）");
         DownloadService.listener = new DownloadService.Listener() {
             @Override public void onJobStart(int index, int total, DownloadService.Job job) {
                 runOnUiThread(() -> {
@@ -199,7 +199,7 @@ public class MainActivity extends Activity {
         ImageView titleIcon = new ImageView(this);
         titleIcon.setImageDrawable(icon(R.drawable.ic_camera, Ui.ACCENT));
         titleRow.addView(titleIcon, new LinearLayout.LayoutParams(dp(30), dp(30)));
-        TextView title = txt("咕嘎图传", 22, Ui.TEXT, true);
+        TextView title = txt("清木图传", 22, Ui.TEXT, true);
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
@@ -632,7 +632,7 @@ public class MainActivity extends Activity {
         AppState st = AppState.get();
         try {
             if (st.client != null) { try { st.client.disconnect(); } catch (Exception ignore) {} }
-            PtpIpClient client = new PtpIpClient(initiatorGuid(), "GugaTuchuan");
+            PtpIpClient client = new PtpIpClient(initiatorGuid(), "QingmuTuchuan");
             st.client = client;
             st.network = network;
             client.setConnectionListener(reason -> {
