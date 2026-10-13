@@ -538,10 +538,11 @@ public class EditorActivity extends Activity {
                     saveBtn.setEnabled(true);
                     shareBtn.setEnabled(true);
                     exportBar.setVisibility(View.GONE);
-                    exportTv.setText("导出失败：" + e.getMessage() + "（细节见诊断页 EDIT 行）");
-                    Toast.makeText(EditorActivity.this, "导出失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+                    String tip = ImageEditor.friendlyError(e);
+                    exportTv.setText("导出失败：" + tip + "（细节见诊断页 EDIT 行）");
+                    Toast.makeText(EditorActivity.this, "导出失败：" + tip, Toast.LENGTH_LONG).show();
                 });
-                Diag.op("EDIT", "导出失败：" + e.getMessage());
+                Diag.op("EDIT", "导出失败（原始异常）：" + e);
             }
         });
     }

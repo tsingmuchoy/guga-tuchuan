@@ -1,6 +1,5 @@
 package com.qingmu.tuchuan;
 
-import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -11,15 +10,10 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
-import android.media.MediaScannerConnection;
 import android.net.Uri;
-import android.os.Build;
-import android.os.Environment;
 import android.os.ParcelFileDescriptor;
-import android.provider.MediaStore;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -220,7 +214,8 @@ public final class ImageEditor {
                 r.height = outH;
                 r.scaledDown = scale < 1.0;
                 Diag.op("EDIT", "导出成功：" + displayName + "（" + outW + "×" + outH
-                        + (r.scaledDown ? "，内存不足已降至 " + (int) (scale * 100) + "% 尺寸" : "，全尺寸") + "）");
+                        + (r.scaledDown ? "，内存不足已降至 " + (int) (scale * 100) + "% 尺寸" : "，全尺寸")
+                        + "）uri=" + uri);
                 return r;
             } catch (OutOfMemoryError oom) {
                 lastErr = new Exception("内存不足");
@@ -236,65 +231,36 @@ public final class ImageEditor {
         throw lastErr != null ? lastErr : new Exception("导出失败");
     }
 
-    /** 发布成品到 Pictures/QingmuTuchuan/Edited，返回可分享的 content Uri（尽力而为） */
+    /** 发布成品到 Pictures/QingmuTuchuan/Edited（v0.4.2 起统一走 AlbumSaver，Images 集合标准流程） */
     private static Uri publishEdited(Context ctx, File tmp, String displayName) throws Exception {
-        if (Build.VERSION.SDK_INT >= 29) {
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
-            v.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
-            v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/QingmuTuchuan/Edited");
-            v.put(MediaStore.MediaColumns.IS_PENDING, 1);
-            Uri uri = ctx.getContentResolver().insert(MediaStore.Files.getContentUri("external"), v);
-            if (uri == null) throw new Exception("MediaStore insert 失败");
-            try (InputStream in = new FileInputStream(tmp);
-                 OutputStream out = ctx.getContentResolver().openOutputStream(uri)) {
-                if (out == null) throw new Exception("MediaStore 打开输出失败");
-                copy(in, out);
-            }
-            v.clear();
-            v.put(MediaStore.MediaColumns.IS_PENDING, 0);
-            ctx.getContentResolver().update(uri, v, null, null);
-            return uri;
-        }
-        // API 26-28：先落盘到公共目录，再登记进 MediaStore 拿到 content Uri 供分享
-        File destDir = new File(Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_PICTURES), "QingmuTuchuan/Edited");
-        //noinspection ResultOfMethodCallIgnored
-        destDir.mkdirs();
-        File dest = uniqueFile(destDir, displayName);
-        try (InputStream in = new FileInputStream(tmp);
-             OutputStream out = new FileOutputStream(dest)) {
-            copy(in, out);
-        }
-        ContentValues v = new ContentValues();
-        v.put(MediaStore.Images.Media.DISPLAY_NAME, dest.getName());
-        v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-        v.put(MediaStore.MediaColumns.DATA, dest.getAbsolutePath());
-        Uri uri = null;
-        try {
-            uri = ctx.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
-        } catch (Exception ignore) {}
-        MediaScannerConnection.scanFile(ctx, new String[]{dest.getAbsolutePath()},
-                new String[]{"image/jpeg"}, null);
-        return uri != null ? uri : Uri.fromFile(dest);
+        return AlbumSaver.saveToAlbum(ctx, tmp, displayName, "image/jpeg",
+                "Pictures/QingmuTuchuan/Edited", true);
     }
 
-    private static File uniqueFile(File dir, String name) {
-        File f = new File(dir, name);
-        if (!f.exists()) return f;
-        String base = name.replaceAll("(?i)\\.jpe?g$", "");
-        for (int i = 2; i < 1000; i++) {
-            File c = new File(dir, base + "_" + i + ".jpg");
-            if (!c.exists()) return c;
+    /** 把原始异常翻成用户可读中文：原始英文报错只进诊断日志，不再整段弹到界面上 */
+    public static String friendlyError(Throwable e) {
+        if (e == null) return "保存失败";
+        if (e instanceof OutOfMemoryError) return "照片太大，手机内存不足，关掉其他应用再试";
+        String raw = e.getMessage() != null ? e.getMessage() : e.toString();
+        // 自家抛出的中文异常本身就是可读文案（不含 MediaStore 字样的），直接透传
+        if (raw.matches(".*[\\u4e00-\\u9fff].*") && !raw.contains("MediaStore")) return raw;
+        String low = raw.toLowerCase(java.util.Locale.US);
+        if (low.contains("not allowed") || low.contains("primary directory")) {
+            return "系统不允许写入这个相册目录";
         }
-        return f;
-    }
-
-    private static void copy(InputStream in, OutputStream out) throws Exception {
-        byte[] buf = new byte[256 * 1024];
-        int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        out.flush();
+        if (low.contains("no space") || low.contains("enospc") || low.contains("not enough space")) {
+            return "手机存储空间不足";
+        }
+        if (e instanceof SecurityException || low.contains("permission")) {
+            return "没有相册写入权限，请到系统设置里允许本应用访问相册";
+        }
+        if (low.contains("no such file") || low.contains("enoent") || low.contains("file not found")) {
+            return "原图文件找不到了（可能被移动或删除）";
+        }
+        if (low.contains("outofmemory") || low.contains("内存不足")) {
+            return "照片太大，手机内存不足，关掉其他应用再试";
+        }
+        return "保存到相册失败";
     }
 
     /** DSC_0001.JPG → DSC_0001_edited.jpg */

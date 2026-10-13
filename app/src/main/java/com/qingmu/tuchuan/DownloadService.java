@@ -4,23 +4,15 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
-import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.media.MediaScannerConnection;
-import android.net.Uri;
 import android.os.Build;
-import android.os.Environment;
 import android.os.IBinder;
 import android.os.PowerManager;
-import android.provider.MediaStore;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -238,43 +230,8 @@ public class DownloadService extends Service {
     }
 
     private void publishToGallery(File src, String filename) throws Exception {
-        String mime = mimeOf(filename);
-        if (Build.VERSION.SDK_INT >= 29) {
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
-            v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-            v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/QingmuTuchuan");
-            v.put(MediaStore.MediaColumns.IS_PENDING, 1);
-            Uri uri = getContentResolver().insert(MediaStore.Files.getContentUri("external"), v);
-            if (uri == null) throw new Exception("MediaStore insert 失败");
-            try (InputStream in = new FileInputStream(src);
-                 OutputStream out = getContentResolver().openOutputStream(uri)) {
-                if (out == null) throw new Exception("MediaStore 打开输出失败");
-                copy(in, out);
-            }
-            v.clear();
-            v.put(MediaStore.MediaColumns.IS_PENDING, 0);
-            getContentResolver().update(uri, v, null, null);
-        } else {
-            File destDir = new File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_PICTURES), "QingmuTuchuan");
-            //noinspection ResultOfMethodCallIgnored
-            destDir.mkdirs();
-            File dest = new File(destDir, filename);
-            try (InputStream in = new FileInputStream(src);
-                 OutputStream out = new FileOutputStream(dest)) {
-                copy(in, out);
-            }
-            MediaScannerConnection.scanFile(this, new String[]{dest.getAbsolutePath()},
-                    new String[]{mime}, null);
-        }
-    }
-
-    private static void copy(InputStream in, OutputStream out) throws Exception {
-        byte[] buf = new byte[256 * 1024];
-        int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        out.flush();
+        // v0.4.2 起统一走 AlbumSaver（旧实现误用 Files 集合写 Pictures，API 29+ 必失败，同出片 bug）
+        AlbumSaver.saveToAlbum(this, src, filename, mimeOf(filename), "Pictures/QingmuTuchuan", false);
     }
 
     private static String mimeOf(String filename) {
