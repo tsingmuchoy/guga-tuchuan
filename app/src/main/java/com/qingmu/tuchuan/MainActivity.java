@@ -39,6 +39,7 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.GridView;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -209,6 +210,9 @@ public class MainActivity extends Activity {
     };
     // 遥控页 v0.4：监看滤镜（View 层 ColorMatrixColorFilter 叠加，默认关）
     private int lvFilterIdx = -1; // -1=关
+    // v0.6：监看滤镜横向胶囊行（底部栏上方展开；与出片共用 Filters 唯一目录，行内带口径小字）
+    private View rcFilterBar;
+    private final List<TextView> lvFilterCaps = new ArrayList<>(); // 槽位=目录索引+1，0=关
     private volatile List<RemoteController.PropItem> propItems = new ArrayList<>();
     private float pendingAfNx = -1, pendingAfNy = -1;
 
@@ -688,6 +692,7 @@ public class MainActivity extends Activity {
         aboutCard.addView(txt("首测机型：Nikon Z fc。其余尼康机型（Z 系列、内置 Wi-Fi 单反、Coolpix Wi-Fi 机型）走标准 PTP/IP 协议兼容、待真机验证；连接后会按相机型号自动匹配机型 profile（见诊断页 PROFILE 行），未知机型用标准默认档直连、不会拦截。", 12, Ui.TEXT_DIM, false), wrapMargin(8));
         aboutCard.addView(txt("无 Wi-Fi 的机型（如仅蓝牙的 D3400/D3500）没有任何 PTP/IP 入口，物理上无法使用本 App。老机型插上 WU-1a/1b 无线适配器后，勾选上方「经 WU 适配器」再连接。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
         aboutCard.addView(txt("当前版本 v" + Updater.currentVersion(this) + "。在线更新走 GitHub 发布源：启动时自动检查一次，连着相机热点（无互联网）时会自动跳过、不打扰；更新包下载到缓存目录，校验大小后经系统安装器安装。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
+        aboutCard.addView(txt("滤镜（共 " + Filters.COUNT + " 款）：带 LUT 的 19 款出片时用 17³ 三维查找表高精度渲染，监看预览为矩阵近似。参数来源：富士数字模拟剖面由 Stuart Sowerby 免费发布（blog.sowerby.me）后拟合；柯达 Portra 400、富士 Pro 400H / Astia 100F、Kodak Tri-X 400、Ilford HP5 Plus、Fuji Neopan Acros 100 源自 Pat David 胶片仿真合集（署名 Pat David、Pavlov Dmitry、Michael Ezra，CC BY-SA 4.0）；经典负片等桥接款经 rollfilm（MIT）转存的富士官方 LUT 数据换算、属风格近似，其中怀旧负片的源数据含 GPL-3 衍生背景；徕卡 4 款无公开实测数据，为公式构造的「风格致敬」。各品牌名称仅作风格描述，不代表官方关联。", 12, Ui.TEXT_DIM, false), wrapMargin(6));
         Button updBtn = btn("检查更新", R.drawable.ic_download, false);
         updBtn.setOnClickListener(v -> checkUpdate(true));
         LinearLayout.LayoutParams ublp2 = matchWrap(); ublp2.setMargins(0, dp(8), 0, 0);
@@ -2015,7 +2020,7 @@ public class MainActivity extends Activity {
             if (remote != null) remote.setHistogramEnabled(histOn);
             setRailOn(railHistBtn, histOn);
         });
-        railFilterBtn.setOnClickListener(v -> showFilterPicker());
+        railFilterBtn.setOnClickListener(v -> toggleLvFilterBar());
         railSizeBtn.setOnClickListener(v -> showSizePicker());
         railPropsBtn.setOnClickListener(v -> setPanelOpen(!rcPanelOpen));
         setRailOn(railGridBtn, true);
@@ -2085,6 +2090,42 @@ public class MainActivity extends Activity {
         movie.setOnClickListener(v -> { if (remote != null) remote.toggleMovie(); });
         movieBtn = movie;
         bottomBar.addView(movie, new LinearLayout.LayoutParams(dp(54), dp(54)));
+
+        // —— 监看滤镜横向胶囊行（v0.6）：默认收起，点右侧栏滤镜钮展开到状态行上方；
+        //    「关」+ 与出片完全同一份 Filters 目录（按分组排），全款用拟合矩阵走渲染层 ——
+        LinearLayout filterBar = new LinearLayout(this);
+        filterBar.setOrientation(LinearLayout.VERTICAL);
+        filterBar.setBackgroundColor(0xB3000000);
+        filterBar.setPadding(dp(10), dp(8), dp(10), dp(6));
+        filterBar.setVisibility(View.GONE);
+        HorizontalScrollView fScroll = new HorizontalScrollView(this);
+        fScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout fRow = new LinearLayout(this);
+        fRow.setGravity(Gravity.CENTER_VERTICAL);
+        for (int i = 0; i <= Filters.COUNT; i++) lvFilterCaps.add(null);
+        addLvFilterCapsule(fRow, -1, "关", true);
+        for (int g : Filters.GROUP_ORDER) {
+            List<Integer> idxs = Filters.indicesInGroup(g);
+            if (idxs.isEmpty()) continue;
+            TextView gh = txt(Filters.GROUP_NAMES[g], 10, Ui.TEXT_DIM, true);
+            LinearLayout.LayoutParams ghlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            ghlp.setMargins(dp(10), 0, dp(2), 0);
+            fRow.addView(gh, ghlp);
+            for (int idx : idxs) {
+                addLvFilterCapsule(fRow, idx, Filters.NAMES[idx] + Filters.noteSuffix(idx), false);
+            }
+        }
+        fScroll.addView(fRow);
+        filterBar.addView(fScroll);
+        TextView fNote = txt("监看滤镜仅预览，照片为相机原片，出片时套用高精度版", 10, Ui.TEXT_DIM, false);
+        LinearLayout.LayoutParams fnlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fnlp.setMargins(0, dp(5), 0, 0);
+        filterBar.addView(fNote, fnlp);
+        bottomWrap.addView(filterBar, 0);
+        rcFilterBar = filterBar;
+        refreshLvFilterCaps();
 
         // —— 未连接引导卡（浮层居中；连上即收起） ——
         LinearLayout rcHintCard = new LinearLayout(this);
@@ -2346,39 +2387,57 @@ public class MainActivity extends Activity {
         if (railSizeBtn != null) railSizeBtn.setEnabled(conn && supported && lvSizeOptions.size() > 1);
     }
 
-    /** v0.4 监看滤镜开关：只给 lvImage 挂/摘 ColorFilter（渲染层），不动取景三线程与诊断口径 */
+    /** v0.4 监看滤镜开关：只给 lvImage 挂/摘 ColorFilter（渲染层），不动取景三线程与诊断口径。
+     *  v0.6：目录扩到 36 款，全款用拟合矩阵近似（LUT 款出片才走高精度，监看不读 LUT 资产）。 */
     private void applyLvFilter(int idx) {
         lvFilterIdx = idx;
         if (lvImage != null) {
             if (idx < 0) lvImage.setColorFilter(null);
             else lvImage.setColorFilter(new ColorMatrixColorFilter(Filters.matrix(idx, 100)));
         }
+        refreshLvFilterCaps();
         if (idx < 0) {
             Diag.op("LVFILTER", "监看滤镜 → 关（默认）");
         } else {
             Diag.op("LVFILTER", "监看滤镜 → " + Filters.NAMES[idx]
-                    + (Filters.isLog(idx) ? "（通用近似，非尼康官方 N-Log 曲线）" : "")
+                    + (Filters.isLog(idx) ? "（通用近似，非尼康官方 N-Log 曲线）" : Filters.noteSuffix(idx))
+                    + (Filters.hasLut(idx) ? "（监看为矩阵近似，出片走 17³ LUT 高精度）" : "")
                     + "：ImageView 渲染层 ColorMatrix 叠加，不进拉帧/解码/呈现链；帧率与抖动诊断照常记录，真机若拖累帧率由自适应锁档处理");
             if (rcStatusTv != null) rcStatusTv.setText("监看滤镜：" + Filters.NAMES[idx] + "（仅预览，不影响原图）");
         }
     }
 
-    /** 监看滤镜选择弹层（与参数选择共用自绘深色卡）：列「关 + 全部滤镜」，当前项黄标 */
-    private void showFilterPicker() {
-        ovList.removeAllViews();
-        ovTitleTv.setText("监看滤镜（仅手机预览，不影响相机原图与录像）");
-        Button off = btn("关", 0, lvFilterIdx < 0);
-        off.setOnClickListener(v -> { rcOverlay.setVisibility(View.GONE); applyLvFilter(-1); });
-        LinearLayout.LayoutParams olp = matchWrap(); olp.setMargins(0, dp(6), 0, 0);
-        ovList.addView(off, olp);
-        for (int i = 0; i < Filters.COUNT; i++) {
-            final int idx = i;
-            Button b = btn(Filters.NAMES[i] + (Filters.isLog(i) ? "（通用近似）" : ""), 0, idx == lvFilterIdx);
-            b.setOnClickListener(v -> { rcOverlay.setVisibility(View.GONE); applyLvFilter(idx); });
-            LinearLayout.LayoutParams blp = matchWrap(); blp.setMargins(0, dp(6), 0, 0);
-            ovList.addView(b, blp);
+    /** 监看滤镜胶囊行展开/收起（v0.6：横向滚动胶囊行取代旧竖排弹层） */
+    private void toggleLvFilterBar() {
+        if (rcFilterBar == null) return;
+        boolean show = rcFilterBar.getVisibility() != View.VISIBLE;
+        rcFilterBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        setRailOn(railFilterBtn, show);
+        if (show) refreshLvFilterCaps();
+    }
+
+    private void addLvFilterCapsule(LinearLayout row, final int catalogIdx, String label, boolean first) {
+        TextView c = txt(label, 12, Ui.TEXT, true);
+        c.setGravity(Gravity.CENTER);
+        c.setSingleLine(true);
+        c.setPadding(dp(11), dp(6), dp(11), dp(6));
+        c.setClickable(true);
+        c.setOnClickListener(v -> applyLvFilter(catalogIdx));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        if (!first) lp.setMargins(dp(6), 0, 0, 0);
+        row.addView(c, lp);
+        lvFilterCaps.set(catalogIdx + 1, c);
+    }
+
+    private void refreshLvFilterCaps() {
+        for (int i = 0; i < lvFilterCaps.size(); i++) {
+            TextView c = lvFilterCaps.get(i);
+            if (c == null) continue;
+            boolean on = (i - 1) == lvFilterIdx;
+            c.setBackground(getDrawable(on ? R.drawable.bg_btn_primary : R.drawable.bg_btn_ghost));
+            c.setTextColor(on ? Ui.ACCENT_TX : Ui.TEXT);
         }
-        rcOverlay.setVisibility(View.VISIBLE);
     }
 
     /** 帧尺寸档选择弹层：列相机自报的全部档位（不再只有流畅/清晰两极），点选走中枢 setLvSizeIndex */

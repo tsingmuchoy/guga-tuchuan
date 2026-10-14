@@ -37,6 +37,9 @@ import java.io.OutputStream;
  *   在 AlbumSaver 清除 IS_PENDING 之前经 AfterWriteHook 完成，失败只记诊断、不拖垮导出。
  *   说明：Bitmap.compress 的色度抽样（4:2:0）由系统编码器固定、应用层不可控，即便质量 100
  *   也存在二次编码的理论损失下限——目标是把它压到肉眼基本不可感，而不是宣称无损。
+ * v0.6：滤镜目录扩到 36 款（Filters 统一数据源）；带 LUT 的 19 款出片改走 LutEngine
+ *   17^3 三线性查表（条带内就地处理、无整图中间缓冲，预览图同样走 LUT 保证所见即所得），
+ *   载入失败回退矩阵；无 LUT 的款（徕卡构造 3 款 + 原 14 款）继续矩阵 Paint 路径。
  */
 public final class ImageEditor {
 
@@ -114,8 +117,10 @@ public final class ImageEditor {
 
     // ---------- 预览合成（小图整张画） ----------
 
-    /** 在已转正的预览图基础上合成成品预览：滤镜 Paint + 边框模板；返回新图（调用方负责回收） */
-    public static Bitmap renderFromBitmap(Bitmap orientedSrc, int template, int filterIdx,
+    /** 在已转正的预览图基础上合成成品预览：滤镜 + 边框模板；返回新图（调用方负责回收）。
+     *  v0.6：带 LUT 的滤镜在预览上也走 LUT（预览图 ≤1600px，逐像素查表成本可控，所见即所得）；
+     *  LUT 载入失败回退矩阵 Paint。其余滤镜仍走矩阵 Paint。 */
+    public static Bitmap renderFromBitmap(Context ctx, Bitmap orientedSrc, int template, int filterIdx,
                                           int strength, ExifMeta meta, String fallbackName) {
         int sw = orientedSrc.getWidth(), sh = orientedSrc.getHeight();
         float[] mg = Frames.margins(template);
@@ -125,7 +130,27 @@ public final class ImageEditor {
         Canvas canvas = new Canvas(out);
         canvas.drawColor(Frames.bgColor(template));
         RectF img = new RectF(mg[0] * sw, mg[1] * sw, mg[0] * sw + sw, mg[1] * sw + sh);
-        canvas.drawBitmap(orientedSrc, null, img, photoPaint(filterIdx, strength));
+        Bitmap photoSrc = orientedSrc;
+        Bitmap lutCopy = null;
+        Paint paint;
+        byte[] lut = null;
+        if (filterIdx >= 0 && strength > 0 && Filters.hasLut(filterIdx)) {
+            lut = LutEngine.load(ctx, filterIdx);
+        }
+        if (lut != null) {
+            lutCopy = orientedSrc.copy(Bitmap.Config.ARGB_8888, true);
+            if (lutCopy != null) {
+                LutEngine.applyInPlace(lutCopy, lut, strength / 100f);
+                photoSrc = lutCopy;
+                paint = photoPlainPaint();
+            } else {
+                paint = photoPaint(filterIdx, strength);
+            }
+        } else {
+            paint = photoPaint(filterIdx, strength);
+        }
+        canvas.drawBitmap(photoSrc, null, img, paint);
+        if (lutCopy != null) lutCopy.recycle();
         Frames.drawDecor(canvas, img, outW, outH, template, meta, fallbackName);
         return out;
     }
@@ -165,9 +190,19 @@ public final class ImageEditor {
         boolean swap = swapsAxes(orientation);
         int dispW = swap ? storedH : storedW;
         int dispH = swap ? storedW : storedH;
+        // v0.6：带 LUT 的滤镜出片走 17^3 LUT 高精度路径（条带内逐像素三线性查表）；
+        // LUT 载入失败自动回退矩阵 Paint，绝不让导出整体失败。
+        byte[] lutData = null;
+        if (filterIdx >= 0 && strength > 0 && Filters.hasLut(filterIdx)) {
+            lutData = LutEngine.load(ctx, filterIdx);
+        }
+        final float lutT = strength / 100f;
         Diag.op("EDIT", "导出开始：存储 " + storedW + "×" + storedH + "，方向 " + orientation
                 + "，显示 " + dispW + "×" + dispH + "，模板=" + Frames.NAMES[template]
-                + "，滤镜=" + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无")
+                + "，滤镜=" + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + Filters.noteSuffix(filterIdx)
+                + " " + strength + "%" : "无")
+                + "，出片路径=" + (filterIdx < 0 || strength <= 0 ? "无滤镜"
+                : lutData != null ? "17³ LUT 高精度" : "矩阵")
                 + "，画质=" + quality);
 
         float[] mg = Frames.margins(template);
@@ -186,7 +221,7 @@ public final class ImageEditor {
                 float imgT = (float) (mg[1] * dispW * scale);
                 RectF img = new RectF(imgL, imgT,
                         imgL + (float) (dispW * scale), imgT + (float) (dispH * scale));
-                Paint paint = photoPaint(filterIdx, strength);
+                Paint paint = lutData != null ? photoPlainPaint() : photoPaint(filterIdx, strength);
                 canvas.save();
                 canvas.translate(imgL, imgT);
                 canvas.scale((float) scale, (float) scale);
@@ -199,6 +234,7 @@ public final class ImageEditor {
                         int h = Math.min(STRIP_ROWS, storedH - y);
                         Bitmap strip = decoder.decodeRegion(new Rect(0, y, storedW, y + h), sopt);
                         if (strip == null) throw new Exception("条带解码失败 y=" + y);
+                        if (lutData != null) LutEngine.applyInPlace(strip, lutData, lutT); // 条带内查表，不增整图缓冲
                         canvas.drawBitmap(strip, 0, y, paint);
                         strip.recycle();
                         strips++;
@@ -215,6 +251,7 @@ public final class ImageEditor {
                         full = BitmapFactory.decodeStream(in, null, fopt);
                     }
                     if (full == null) throw new Exception("原图整图解码失败");
+                    if (lutData != null) LutEngine.applyInPlace(full, lutData, lutT);
                     canvas.drawBitmap(full, 0, 0, paint);
                     full.recycle();
                 }
@@ -397,6 +434,13 @@ public final class ImageEditor {
         if (filterIdx >= 0 && strength > 0) {
             p.setColorFilter(new ColorMatrixColorFilter(Filters.matrix(filterIdx, strength)));
         }
+        return p;
+    }
+
+    /** LUT 路径用：像素已逐像素处理，绘制 Paint 不再挂任何 ColorFilter */
+    private static Paint photoPlainPaint() {
+        Paint p = new Paint();
+        p.setFilterBitmap(true);
         return p;
     }
 }

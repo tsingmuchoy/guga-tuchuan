@@ -20,6 +20,8 @@ javac -source 8 -target 8 -g:none -encoding UTF-8 -cp "$AJ" -d "$OUT/classes" @"
 "$BT/d8" --lib "$AJ" --min-api 26 --output "$OUT/dex" $(find "$OUT/classes" -name "*.class")
 cp "$OUT/app-unsigned.apk" "$OUT/app-with-dex.apk"
 (cd "$OUT" && zip -9 -j app-with-dex.apk dex/classes.dex > /dev/null)
+# v0.6：assets（滤镜 17^3 LUT 的 .lut.gz 等）以存储模式打入——内容已 gzip 压缩，避免二次压缩
+if [ -d "$SRC/assets" ]; then (cd "$SRC" && zip -0 -r "$OUT/app-with-dex.apk" assets > /dev/null); fi
 "$BT/zipalign" -p -f 4 "$OUT/app-with-dex.apk" "$OUT/app-aligned.apk"
 APK="$HOME/workspace/nikon-transfer/qingmu-tuchuan-v$VER_NAME.apk"
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$APK" "$OUT/app-aligned.apk"

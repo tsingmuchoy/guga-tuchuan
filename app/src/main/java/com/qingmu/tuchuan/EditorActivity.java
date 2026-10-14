@@ -73,7 +73,7 @@ public class EditorActivity extends Activity {
     // v0.4.1：滤镜缩略图条（小样只算一次并缓存，约 180px；长按大图看原图对比）
     private static final int THUMB_MAX = 180;
     private Bitmap thumbBase;                    // 小样底图（srcPreview 的进一步降采样）
-    private final List<Bitmap> filterThumbs = new ArrayList<>(); // 与 filterChips 同序：原图 + 14 滤镜
+    private final List<Bitmap> filterThumbs = new ArrayList<>(); // 与 Filters 目录同序的 36 张小样（原图格直接用 thumbBase）
     private final List<ImageView> filterThumbIvs = new ArrayList<>();
     private final List<View> filterThumbCells = new ArrayList<>();
     private TextView compareHintTv;
@@ -328,39 +328,62 @@ public class EditorActivity extends Activity {
         for (int i = 0; i < frameChips.size(); i++) styleChip(frameChips.get(i), i == template);
     }
 
+    /** 滤镜条一格：catalogIdx=-1 为「原图」格；视图存进与目录同序的数组（槽位 = 目录索引+1） */
+    private void addFilterCell(LinearLayout row, final int catalogIdx, String label, boolean first) {
+        LinearLayout cell = new LinearLayout(this);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER_HORIZONTAL);
+        cell.setPadding(dp(4), dp(4), dp(4), dp(4));
+        ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackgroundColor(Ui.PANEL_ALT);
+        cell.addView(iv, new LinearLayout.LayoutParams(dp(56), dp(46)));
+        TextView name = txt(label, 11, Ui.TEXT, true);
+        name.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        nlp.setMargins(0, dp(3), 0, 0);
+        cell.addView(name, nlp);
+        cell.setOnClickListener(v -> setFilter(catalogIdx));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        if (!first) lp.setMargins(dp(6), 0, 0, 0);
+        row.addView(cell, lp);
+        int slot = catalogIdx + 1;
+        filterChips.set(slot, name);
+        filterThumbIvs.set(slot, iv);
+        filterThumbCells.set(slot, cell);
+    }
+
     private View buildFilterPanel() {
         LinearLayout col = panelCol();
         HorizontalScrollView scroll = new HorizontalScrollView(this);
         scroll.setHorizontalScrollBarEnabled(false);
         LinearLayout row = new LinearLayout(this);
-        // 第 0 格「原图」+ 14 个滤镜：每格一张实时渲染小样 + 名称（小样由 buildThumbStrip 填充）
-        String[] labels = new String[Filters.COUNT + 1];
-        labels[0] = "原图";
-        System.arraycopy(Filters.NAMES, 0, labels, 1, Filters.COUNT);
-        for (int i = 0; i < labels.length; i++) {
-            final int chipIdx = i;
-            LinearLayout cell = new LinearLayout(this);
-            cell.setOrientation(LinearLayout.VERTICAL);
-            cell.setGravity(Gravity.CENTER_HORIZONTAL);
-            cell.setPadding(dp(4), dp(4), dp(4), dp(4));
-            ImageView iv = new ImageView(this);
-            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            iv.setBackgroundColor(Ui.PANEL_ALT);
-            cell.addView(iv, new LinearLayout.LayoutParams(dp(56), dp(46)));
-            TextView name = txt(labels[i], 11, Ui.TEXT, true);
-            name.setGravity(Gravity.CENTER);
-            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            nlp.setMargins(0, dp(3), 0, 0);
-            cell.addView(name, nlp);
-            cell.setOnClickListener(v -> setFilter(chipIdx - 1));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            if (i > 0) lp.setMargins(dp(6), 0, 0, 0);
-            row.addView(cell, lp);
-            filterChips.add(name);
-            filterThumbIvs.add(iv);
-            filterThumbCells.add(cell);
+        // v0.6：与 Filters 目录同序——「原图」格在前，其后按分组（富士/徕卡/经典胶片/黑白/创意/Log）
+        // 依次排：分组竖排小标题 + 该组滤镜格。视图数组按「目录索引+1」存取（0=原图），添加顺序只决定显示。
+        for (int i = 0; i <= Filters.COUNT; i++) {
+            filterChips.add(null);
+            filterThumbIvs.add(null);
+            filterThumbCells.add(null);
+        }
+        addFilterCell(row, -1, "原图", true);
+        for (int g : Filters.GROUP_ORDER) {
+            java.util.List<Integer> idxs = Filters.indicesInGroup(g);
+            if (idxs.isEmpty()) continue;
+            StringBuilder vn = new StringBuilder();
+            String gn = Filters.GROUP_NAMES[g];
+            for (int c = 0; c < gn.length(); c++) {
+                if (c > 0) vn.append('\n');
+                vn.append(gn.charAt(c));
+            }
+            TextView gh = txt(vn.toString(), 10, Ui.TEXT_DIM, true);
+            gh.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams ghlp = new LinearLayout.LayoutParams(dp(16),
+                    ViewGroup.LayoutParams.MATCH_PARENT);
+            ghlp.setMargins(dp(8), 0, dp(2), 0);
+            row.addView(gh, ghlp);
+            for (int idx : idxs) addFilterCell(row, idx, Filters.NAMES[idx], false);
         }
         scroll.addView(row);
         col.addView(scroll);
@@ -397,9 +420,10 @@ public class EditorActivity extends Activity {
     }
 
     /**
-     * v0.4.1：滤镜小样生成——把预览图再降采样到约 180px 作底图，逐滤镜 100% 强度各渲染一张。
-     * 只算一次并缓存（filterThumbs），切换强度不重算小样；换照片（新开编辑页）才重算。
-     * 内存：底图约 180×120×4B ≈ 86KB，15 张小样合计约 1.3MB，用完随页面销毁回收。
+     * 滤镜小样生成——把预览图再降采样到约 180px 作底图，逐滤镜 100% 强度各渲染一张。
+     * 只算一次并缓存（filterThumbs 与目录同序），切换强度不重算小样；换照片（新开编辑页）才重算。
+     * 小样一律走矩阵求快（规格口径：出片才用 LUT 高精度）；大图预览/导出则按 LUT 渲染，所见即所得。
+     * 内存：底图约 180×120×4B ≈ 86KB，v0.6 起 36 张小样 + 底图合计约 3.2MB，用完随页面销毁回收。
      */
     private void buildThumbStrip() {
         if (srcPreview == null) return;
@@ -409,8 +433,7 @@ public class EditorActivity extends Activity {
             float k = Math.min(1f, (float) THUMB_MAX / Math.max(w, h));
             Bitmap base = k < 1f ? Bitmap.createScaledBitmap(src, Math.max(1, Math.round(w * k)),
                     Math.max(1, Math.round(h * k)), true) : src;
-            List<Bitmap> thumbs = new ArrayList<>();
-            thumbs.add(base); // 原图格直接用底图
+            List<Bitmap> thumbs = new ArrayList<>(); // 与 Filters 目录同序（不含原图格）
             for (int i = 0; i < Filters.COUNT; i++) {
                 Bitmap t = Bitmap.createBitmap(base.getWidth(), base.getHeight(), Bitmap.Config.ARGB_8888);
                 android.graphics.Canvas cv = new android.graphics.Canvas(t);
@@ -422,18 +445,20 @@ public class EditorActivity extends Activity {
             }
             runOnUiThread(() -> {
                 if (isFinishing()) {
-                    for (Bitmap t : thumbs) if (t != base && t != src) t.recycle();
+                    for (Bitmap t : thumbs) t.recycle();
                     if (base != src) base.recycle();
                     return;
                 }
                 thumbBase = base;
                 filterThumbs.clear();
                 filterThumbs.addAll(thumbs);
-                for (int i = 0; i < filterThumbIvs.size() && i < thumbs.size(); i++) {
-                    filterThumbIvs.get(i).setImageBitmap(thumbs.get(i));
+                if (filterThumbIvs.get(0) != null) filterThumbIvs.get(0).setImageBitmap(base);
+                for (int i = 0; i < thumbs.size(); i++) {
+                    ImageView iv = filterThumbIvs.get(i + 1);
+                    if (iv != null) iv.setImageBitmap(thumbs.get(i));
                 }
-                Diag.op("EDIT", "滤镜小样生成完成：" + thumbs.size() + " 张（约 " + THUMB_MAX
-                        + "px，100% 强度口径；切换强度不重算）");
+                Diag.op("EDIT", "滤镜小样生成完成：" + (thumbs.size() + 1) + " 张（含原图，约 " + THUMB_MAX
+                        + "px，100% 强度、矩阵口径；切换强度不重算）");
             });
         });
     }
@@ -443,17 +468,21 @@ public class EditorActivity extends Activity {
         dirty = true;
         refreshFilterChips();
         Diag.op("EDIT", "静态滤镜 → " + (idx < 0 ? "原图" : Filters.NAMES[idx]
-                + (Filters.isLog(idx) ? "（通用近似，非尼康官方 N-Log 曲线）" : "") + "，强度 " + strength + "%"));
+                + (Filters.isLog(idx) ? "（通用近似，非尼康官方 N-Log 曲线）" : Filters.noteSuffix(idx))
+                + (idx >= 0 && Filters.hasLut(idx) ? "（出片走 17³ LUT 高精度）" : "") + "，强度 " + strength + "%"));
         scheduleRender();
     }
 
     private void refreshFilterChips() {
-        // 选中态：小样格黄描边底 + 名称变黄（filterChips 与格子同序，0=原图对应 filterIdx=-1）
+        // 选中态：小样格黄描边底 + 名称变黄（数组槽位 = 目录索引+1，0=原图对应 filterIdx=-1）
         for (int i = 0; i < filterThumbCells.size(); i++) {
+            View cell = filterThumbCells.get(i);
+            if (cell == null) continue;
             boolean on = i == filterIdx + 1;
-            filterThumbCells.get(i).setBackground(getDrawable(on
+            cell.setBackground(getDrawable(on
                     ? R.drawable.bg_thumb_selected : R.drawable.bg_chip));
-            if (i < filterChips.size()) filterChips.get(i).setTextColor(on ? Ui.ACCENT : Ui.TEXT);
+            TextView nm = i < filterChips.size() ? filterChips.get(i) : null;
+            if (nm != null) nm.setTextColor(on ? Ui.ACCENT : Ui.TEXT);
         }
     }
 
@@ -526,7 +555,7 @@ public class EditorActivity extends Activity {
             if (tpl == Frames.NONE && fidx < 0) {
                 out = src; // 无边框无滤镜：直接用原预览，不额外分配
             } else {
-                out = ImageEditor.renderFromBitmap(src, tpl, fidx, str, m, srcName);
+                out = ImageEditor.renderFromBitmap(this, src, tpl, fidx, str, m, srcName);
             }
             final Bitmap fout = out;
             runOnUiThread(() -> {
@@ -551,7 +580,7 @@ public class EditorActivity extends Activity {
         exportBar.setVisibility(View.VISIBLE);
         exportTv.setText("正在按原图全尺寸导出…");
         Diag.op("EDIT", "开始导出（模板=" + Frames.NAMES[template] + "，滤镜="
-                + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无")
+                + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + Filters.noteSuffix(filterIdx) + " " + strength + "%" : "无")
                 + "，画质=" + quality + "）");
         final int tpl = template, fidx = filterIdx, str = strength, q = quality;
         final ExifMeta m = meta;
