@@ -301,7 +301,11 @@ public class PtpIpClient {
             Le.put32(ereq, 8, (int) connectionNumber);
             writeAll(evtOut, ereq);
             Packet eack = readPacket(evtIn);
-            if (eack.type == PKT_INIT_FAIL) throw new IOException("事件通道 InitFail");
+            if (eack.type == PKT_INIT_FAIL) {
+                int ereason = eack.payload.length >= 4 ? Le.get32(eack.payload, 0) : -1;
+                Diag.op("PTPIP", "事件通道 InitFail 原始 reason=" + ereason + "（payload " + eack.payload.length + "B）");
+                throw new IOException("事件通道 InitFail reason=" + ereason);
+            }
             if (eack.type != PKT_INIT_EVT_ACK) throw new IOException("InitEventAck 异常 type=" + eack.type);
             eventOk = true;
             Diag.op("PTPIP", "事件通道就绪");
@@ -974,13 +978,31 @@ public class PtpIpClient {
     }
 
     public int[] getObjectHandles(int storageId) throws PtpException {
-        Result r = transact(OP_GET_OBJECT_HANDLES, new int[]{storageId, 0, 0}, null);
-        Cursor c = new Cursor(r.data);
-        long n = c.u32();
-        int[] hs = new int[(int) n];
-        for (int i = 0; i < n; i++) hs[i] = c.s32();
-        Diag.op("PTP", "GetObjectHandles：共 " + n + " 个对象");
-        return hs;
+        return getObjectHandles(storageId, 0, 0);
+    }
+
+    /**
+     * v0.6.1：枚举参数可指定并全程打日志（存储/格式/父对象）——
+     * Z 30 外部实测出现「指定存储枚举回 0」，上层会以全通配（storage=0xFFFFFFFF、format=0、parent=0）重试。
+     * 失败时 PtpException 携带响应码，日志里带 rc。
+     */
+    public int[] getObjectHandles(int storageId, int format, int parent) throws PtpException {
+        try {
+            Result r = transact(OP_GET_OBJECT_HANDLES, new int[]{storageId, format, parent}, null);
+            Cursor c = new Cursor(r.data);
+            long n = c.u32();
+            int[] hs = new int[(int) n];
+            for (int i = 0; i < n; i++) hs[i] = c.s32();
+            Diag.op("PTP", "GetObjectHandles(storage=0x" + Integer.toHexString(storageId)
+                    + " format=0x" + Integer.toHexString(format) + " parent=0x" + Integer.toHexString(parent)
+                    + ") rc=0x" + Integer.toHexString(r.responseCode) + "：共 " + n + " 个对象（原始句柄数）");
+            return hs;
+        } catch (PtpException e) {
+            Diag.op("PTP", "GetObjectHandles(storage=0x" + Integer.toHexString(storageId)
+                    + " format=0x" + Integer.toHexString(format) + " parent=0x" + Integer.toHexString(parent)
+                    + ") 失败 rc=0x" + Integer.toHexString(e.responseCode) + "：" + e.getMessage());
+            throw e;
+        }
     }
 
     public ObjectInfo getObjectInfo(int handle) throws PtpException {

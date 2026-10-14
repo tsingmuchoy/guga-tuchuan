@@ -123,6 +123,8 @@ public class MainActivity extends Activity {
         int downloadedCount() { int n = 0; for (PhotoItem p : files()) if (p.downloaded) n++; return n; }
     }
     private final List<GalleryRow> displayRows = new ArrayList<>();
+    /** v0.6.1：最近一次照片枚举的失败/为空原因（列表为空时显示在照片页空状态卡，禁止静默空白） */
+    private volatile String photoLoadNote = null;
     private static final int FILTER_ALL = 0, FILTER_NOT_DL = 1, FILTER_JPG = 2, FILTER_RAW = 3, FILTER_DATE = 4;
     private static final int REQ_PICK_PHOTO = 4101; // v0.4.1 出片导入系统照片选择器
     private int filterMode = FILTER_ALL;
@@ -236,6 +238,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        CrashLog.install(this); // v0.6.1：未捕获异常先落盘再交系统，下次启动回放进诊断 [CRASH]
         prefs = getSharedPreferences("guga_tuchuan", MODE_PRIVATE);
         thumbCache = new ThumbCache(this);
         DownloadRecord.init(this);
@@ -243,7 +246,8 @@ public class MainActivity extends Activity {
         buildUi();
         pollHandler.postDelayed(pollTick, 2000); // v0.5.1 速览轮询兜底（Runnable 内自带页面/连接/忙碌门控）
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.5.1 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/69 张照片列表；下载/拍摄/录像/间隔拍摄与在线更新待复测；其余机型标准协议兼容待验证）");
+        CrashLog.dumpPending(this); // v0.6.1：回放上次崩溃堆栈（STA 点按钮退出定性靠它）
+        Diag.log("清木图传 v0.6.1 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/69 张照片列表；v0.6.1 针对 Z 30 外部反馈热修：手选帧尺寸锁定/照片枚举硬化/STA 异常兜底，均待复测）");
         // v0.5 在线更新：启动自动检查一次（延迟避开首帧；静默口径——失败只记 [UPDATE] 诊断不打扰）
         new Handler(Looper.getMainLooper()).postDelayed(() -> checkUpdate(false), 1500);
         DownloadService.listener = new DownloadService.Listener() {
@@ -313,6 +317,19 @@ public class MainActivity extends Activity {
     // ================= UI 搭建 =================
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
+
+    /**
+     * v0.6.1 操作入口异常兜底（Z 30 STA「点任何按钮就退出」对策）：
+     * 遥控/照片等入口统一经此执行——任何异常只记 [GUARD] 诊断 + 弹中文错误，绝不许把 App 弄崩或整页退出。
+     */
+    private void guarded(final String what, final Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            Diag.op("GUARD", what + " 异常已拦截（App 未退出）：" + t);
+            Toast.makeText(this, what + "出错，已记录到诊断页：" + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
 
     private TextView txt(String s, int sp, int color, boolean bold) {
         TextView t = new TextView(this);
@@ -395,7 +412,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.5.1", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.6.1", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -436,7 +453,7 @@ public class MainActivity extends Activity {
             t.setCompoundDrawables(null, d, null, null);
             t.setCompoundDrawablePadding(dp(3));
             t.setPadding(0, dp(6), 0, dp(6));
-            t.setOnClickListener(v -> showPage(idx));
+            t.setOnClickListener(v -> guarded("切换页面", () -> showPage(idx)));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
             tabs.addView(t, lp);
             tabBtns[i] = t;
@@ -583,8 +600,8 @@ public class MainActivity extends Activity {
         btnRow.addView(disconnectBtn, dlp);
         LinearLayout.LayoutParams brlp = matchWrap(); brlp.setMargins(0, dp(10), 0, 0);
         col.addView(btnRow, brlp);
-        connectBtn.setOnClickListener(v -> onConnectClicked());
-        disconnectBtn.setOnClickListener(v -> onDisconnectClicked());
+        connectBtn.setOnClickListener(v -> guarded("连接相机", this::onConnectClicked));
+        disconnectBtn.setOnClickListener(v -> guarded("断开连接", this::onDisconnectClicked));
 
         statusTv = txt("状态：未连接", 13, Ui.TEXT_DIM, false);
         col.addView(statusTv, wrapMargin(10));
@@ -674,7 +691,7 @@ public class MainActivity extends Activity {
         readPhotosBtn = btn("读取照片", R.drawable.ic_badge_image, true);
         LinearLayout.LayoutParams rlp = matchWrap(); rlp.setMargins(0, dp(8), 0, 0);
         col.addView(readPhotosBtn, rlp);
-        readPhotosBtn.setOnClickListener(v -> loadPhotos());
+        readPhotosBtn.setOnClickListener(v -> guarded("读取照片", this::loadPhotos));
 
         // 关于/兼容性卡（诚实标注）
         LinearLayout aboutCard = card();
@@ -718,7 +735,7 @@ public class MainActivity extends Activity {
         formatBtn.setTextColor(Ui.ERR);
         LinearLayout.LayoutParams fblp = matchWrap(); fblp.setMargins(0, dp(8), 0, 0);
         mgmtCard.addView(formatBtn, fblp);
-        formatBtn.setOnClickListener(v -> onFormatClicked());
+        formatBtn.setOnClickListener(v -> guarded("格式化", this::onFormatClicked));
         col.addView(mgmtCard);
         updateFormatVisibility();
 
@@ -1172,21 +1189,29 @@ public class MainActivity extends Activity {
         grid.setPadding(dp(2), dp(4), dp(2), dp(96));
         adapter = new PhotoAdapter();
         grid.setAdapter(adapter);
-        grid.setOnItemClickListener((parent, view, position, id) -> {
+        grid.setOnItemClickListener((parent, view, position, id) -> guarded("选择照片", () -> {
             if (position < 0 || position >= displayRows.size()) return;
             GalleryRow row = displayRows.get(position);
+            // v0.6.1：信息读取失败的占位条目不可勾选，给中文原因（失败码在诊断里）
+            if (row.a.infoFailed) {
+                Toast.makeText(this, "这张照片的信息读取失败（码 0x" + Integer.toHexString(row.a.infoFailRc)
+                        + "），暂时无法预览和下载，细节见诊断页", Toast.LENGTH_LONG).show();
+                return;
+            }
             if (row.isPair()) { showPairChooser(row); return; }
             row.a.selected = !row.a.selected;
             updateSelInfo();
             adapter.notifyDataSetChanged();
-        });
+        }));
         grid.setOnItemLongClickListener((parent, view, position, id) -> {
-            if (position < 0 || position >= displayRows.size()) return true;
-            GalleryRow row = displayRows.get(position);
-            boolean target = row.selectedCount() < row.files().size();
-            for (PhotoItem p : row.files()) p.selected = target;
-            updateSelInfo();
-            adapter.notifyDataSetChanged();
+            guarded("批量选择照片", () -> {
+                if (position < 0 || position >= displayRows.size()) return;
+                GalleryRow row = displayRows.get(position);
+                boolean target = row.selectedCount() < row.files().size();
+                for (PhotoItem p : row.files()) if (!p.infoFailed) p.selected = target;
+                updateSelInfo();
+                adapter.notifyDataSetChanged();
+            });
             return true;
         });
         col.addView(grid, new LinearLayout.LayoutParams(
@@ -1229,9 +1254,9 @@ public class MainActivity extends Activity {
         dlRow.addView(dlBtn, drlp);
         LinearLayout.LayoutParams frlp = matchWrap(); frlp.setMargins(0, dp(8), 0, 0);
         floatBar.addView(dlRow, frlp);
-        dlBtn.setOnClickListener(v -> onDownloadClicked());
-        delBtn.setOnClickListener(v -> onDeleteClicked());
-        editBtn.setOnClickListener(v -> onEditClicked());
+        dlBtn.setOnClickListener(v -> guarded("下载照片", this::onDownloadClicked));
+        delBtn.setOnClickListener(v -> guarded("删除照片", this::onDeleteClicked));
+        editBtn.setOnClickListener(v -> guarded("出片", this::onEditClicked));
         FrameLayout.LayoutParams floatLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
         floatLp.setMargins(dp(8), 0, dp(8), dp(8));
@@ -1379,9 +1404,14 @@ public class MainActivity extends Activity {
         if (!empty) return;
         boolean connected = AppState.get().client != null && AppState.get().client.isConnected();
         if (AppState.get().photos.isEmpty()) {
-            photosEmptyTv.setText(connected
-                    ? "已连接相机，但还没读取照片清单：点连接页的「读取照片」，或回到本页再点一次读取，相机卡上的照片会出现在这里，勾选后即可批量下载到相册（支持断点续传）。"
-                    : "还没有照片：先连接相机（连接页，相机热点或「连接至 PC」均可），再点「读取照片」，这里会出现相机卡里的照片墙，可勾选批量下载 JPEG/NEF 原图到相册，带断点续传与自动重连。");
+            if (photoLoadNote != null) {
+                // v0.6.1：枚举失败/为空的具体原因（相机返回 0 个对象、失败码等），禁止静默空白
+                photosEmptyTv.setText(photoLoadNote);
+            } else {
+                photosEmptyTv.setText(connected
+                        ? "已连接相机，但还没读取照片清单：点连接页的「读取照片」，或回到本页再点一次读取，相机卡上的照片会出现在这里，勾选后即可批量下载到相册（支持断点续传）。"
+                        : "还没有照片：先连接相机（连接页，相机热点或「连接至 PC」均可），再点「读取照片」，这里会出现相机卡里的照片墙，可勾选批量下载 JPEG/NEF 原图到相册，带断点续传与自动重连。");
+            }
         } else {
             photosEmptyTv.setText("当前筛选下没有照片（筛选条切回「全部」看全部 " + AppState.get().photos.size() + " 张）。");
         }
@@ -1948,7 +1978,7 @@ public class MainActivity extends Activity {
         backTv.setBackground(getDrawable(R.drawable.bg_chip));
         backTv.setPadding(dp(10), dp(5), dp(10), dp(5));
         backTv.setClickable(true);
-        backTv.setOnClickListener(v -> showPage(0)); // 退出全屏：恢复框架/系统栏 + 既有切页 teardown 停取景
+        backTv.setOnClickListener(v -> guarded("退出全屏", () -> showPage(0))); // 退出全屏：恢复框架/系统栏 + 既有切页 teardown 停取景
         rcBackBtn = backTv;
         topBar.addView(backTv);
         rcTopSubTv = txt("电量 — · 剩余可拍 —", 11, Ui.TEXT_DIM, false);
@@ -2005,24 +2035,24 @@ public class MainActivity extends Activity {
         rail.addView(railSizeBtn, railItemLp(true));
         railPropsBtn = railBtn(R.drawable.ic_settings);
         rail.addView(railPropsBtn, railItemLp(true));
-        railLvBtn.setOnClickListener(v -> {
+        railLvBtn.setOnClickListener(v -> guarded("开关取景", () -> {
             if (remote == null) { Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show(); return; }
             if (remote.isLiveViewOn()) remote.stopLiveView(); else remote.startLiveView();
-        });
-        railGridBtn.setOnClickListener(v -> {
+        }));
+        railGridBtn.setOnClickListener(v -> guarded("网格线开关", () -> {
             gridOn = !gridOn;
             hud.setGridOn(gridOn);
             setRailOn(railGridBtn, gridOn);
-        });
-        railHistBtn.setOnClickListener(v -> {
+        }));
+        railHistBtn.setOnClickListener(v -> guarded("直方图开关", () -> {
             histOn = !histOn;
             hud.setHistOn(histOn);
             if (remote != null) remote.setHistogramEnabled(histOn);
             setRailOn(railHistBtn, histOn);
-        });
-        railFilterBtn.setOnClickListener(v -> toggleLvFilterBar());
-        railSizeBtn.setOnClickListener(v -> showSizePicker());
-        railPropsBtn.setOnClickListener(v -> setPanelOpen(!rcPanelOpen));
+        }));
+        railFilterBtn.setOnClickListener(v -> guarded("监看滤镜", this::toggleLvFilterBar));
+        railSizeBtn.setOnClickListener(v -> guarded("帧尺寸选择", this::showSizePicker));
+        railPropsBtn.setOnClickListener(v -> guarded("参数面板", () -> setPanelOpen(!rcPanelOpen)));
         setRailOn(railGridBtn, true);
         setRailOn(railHistBtn, true);
 
@@ -2077,7 +2107,7 @@ public class MainActivity extends Activity {
             else if (ev.getAction() == MotionEvent.ACTION_UP || ev.getAction() == MotionEvent.ACTION_CANCEL) shutterInner.setAlpha(1f);
             return false; // 不吞事件，click 照常触发
         });
-        shutter.setOnClickListener(v -> { if (remote != null) remote.capture(); });
+        shutter.setOnClickListener(v -> guarded("遥控拍摄", () -> { if (remote != null) remote.capture(); }));
         captureBtn = shutter;
         bottomBar.addView(shutter, new LinearLayout.LayoutParams(dp(76), dp(76)));
         bottomBar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
@@ -2087,7 +2117,7 @@ public class MainActivity extends Activity {
         movieIconIv = new ImageView(this);
         movieIconIv.setImageDrawable(icon(R.drawable.ic_rec, Ui.ERR));
         movie.addView(movieIconIv, new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER));
-        movie.setOnClickListener(v -> { if (remote != null) remote.toggleMovie(); });
+        movie.setOnClickListener(v -> guarded("录像", () -> { if (remote != null) remote.toggleMovie(); }));
         movieBtn = movie;
         bottomBar.addView(movie, new LinearLayout.LayoutParams(dp(54), dp(54)));
 
@@ -2235,7 +2265,7 @@ public class MainActivity extends Activity {
         ivInputRow.addView(ivCountEt, iclp);
         panCol.addView(ivInputRow, wrapMargin(8));
         ivBtn = btn("开始间隔拍摄", R.drawable.ic_timer, true);
-        ivBtn.setOnClickListener(v -> onIntervalToggle());
+        ivBtn.setOnClickListener(v -> guarded("间隔拍摄", this::onIntervalToggle));
         panCol.addView(ivBtn, wrapMargin(8));
         ivStatusTv = txt("未开始", 12, Ui.TEXT_DIM, false);
         panCol.addView(ivStatusTv, wrapMargin(6));
@@ -2455,7 +2485,7 @@ public class MainActivity extends Activity {
                     + (i == 0 ? "（流畅）" : i == lvSizeOptions.size() - 1 ? "（清晰）" : "")
                     + (idx == lvSizeCurrent ? "（当前）" : "");
             Button b = btn(label, 0, idx == lvSizeCurrent);
-            b.setOnClickListener(v -> { rcOverlay.setVisibility(View.GONE); if (remote != null) remote.setLvSizeIndex(idx); });
+            b.setOnClickListener(v -> guarded("切换帧尺寸", () -> { rcOverlay.setVisibility(View.GONE); if (remote != null) remote.setLvSizeIndex(idx); }));
             LinearLayout.LayoutParams blp = matchWrap(); blp.setMargins(0, dp(6), 0, 0);
             ovList.addView(b, blp);
         }
@@ -2700,7 +2730,7 @@ public class MainActivity extends Activity {
         }
         @Override public void onLvState(String sizeLabel, int targetFps, float displayFps, String note) {
             runOnUiThread(() -> {
-                rcLvStateTv.setText(sizeLabel + " · " + String.format("%.0f", displayFps) + "fps");
+                rcLvStateTv.setText(sizeLabel + " · 约 " + String.format("%.0f", displayFps) + "fps"); // 如实播报所选档的实际呈现帧率
                 if (note != null) {
                     lvNoteTv.setText(note);
                     lvNoteTv.setVisibility(View.VISIBLE);
@@ -3036,6 +3066,17 @@ public class MainActivity extends Activity {
     private void doPtpConnect(Network network, String host, int port) {
         AppState st = AppState.get();
         try {
+            // v0.6.1 审计（AP/STA 路径差异）：STA（network==null）必须走局域网默认路由——
+            // 若进程还绑在上一次 AP 会话的相机热点 Network 上（bindProcessToNetwork），默认 Socket 会被
+            // 强行走那条已失效的热点、连不上局域网相机。这里在 STA 连接前显式解绑并注销旧热点回调；
+            // AP 路径绝不能调 wifi.disconnect()（会拆掉刚建好的热点连接）。
+            if (network == null) {
+                st.wifi.disconnect();
+                Diag.op("PTPIP", "连接模式=STA（连接至 PC）：已清除进程网络绑定与旧热点回调，Socket 走默认局域网路由，目标 "
+                        + host + ":" + port);
+            } else {
+                Diag.op("PTPIP", "连接模式=AP（相机热点）：Socket 经相机热点 Network 创建，目标 " + host + ":" + port);
+            }
             if (st.client != null) { try { st.client.disconnect(); } catch (Exception ignore) {} }
             PtpIpClient client = new PtpIpClient(initiatorGuid(), "QingmuTuchuan");
             st.client = client;
@@ -3134,19 +3175,69 @@ public class MainActivity extends Activity {
         selInfoTv.setText("正在读取照片列表…");
         bg.execute(() -> {
             try {
-                int[] handles = st.client.getObjectHandles(st.storageId);
+                // v0.6.1 枚举硬化（Z 30 外部实测「共 0 张」对策）：指定存储枚举失败或回 0 时，
+                // 自动以全通配（storage=0xFFFFFFFF、format=0、parent=0）重试一次再下结论；
+                // 单项 ObjectInfo 失败不再整表丢弃——占位保留，保证列表数量与相机一致；全程计数打日志。
+                int[] handles = null;
+                PtpIpClient.PtpException specErr = null;
+                try {
+                    handles = st.client.getObjectHandles(st.storageId, 0, 0);
+                } catch (PtpIpClient.PtpException e) {
+                    specErr = e;
+                }
+                if (handles == null || handles.length == 0) {
+                    Diag.op("PTP", "指定存储枚举" + (handles == null
+                            ? "失败 rc=0x" + Integer.toHexString(specErr.responseCode)
+                            : "返回 0 个对象") + "，降级以全通配（storage=0xFFFFFFFF）重试一次");
+                    try {
+                        int[] wild = st.client.getObjectHandles(0xFFFFFFFF, 0, 0);
+                        if (handles == null || wild.length > 0) handles = wild;
+                    } catch (PtpIpClient.PtpException e2) {
+                        Diag.op("PTP", "通配枚举同样失败 rc=0x" + Integer.toHexString(e2.responseCode));
+                        if (handles == null) {
+                            photoLoadNote = "读取照片列表失败（码 0x" + Integer.toHexString(e2.responseCode)
+                                    + "）：相机没有返回照片清单，细节见诊断页；可断开重连后再试。";
+                            st.photos.clear();
+                            runOnUiThread(() -> {
+                                rebuildDisplay(); updateSelInfo(); updateAutoUi();
+                                Toast.makeText(this, "读取照片列表失败（码 0x"
+                                        + Integer.toHexString(e2.responseCode) + "），见诊断页", Toast.LENGTH_LONG).show();
+                            });
+                            return;
+                        }
+                    }
+                }
                 List<PhotoItem> list = new ArrayList<>();
+                int infoOk = 0, infoFail = 0, folderSkip = 0;
+                int firstFailRc = -1;
+                String firstFailMsg = null;
                 int done = 0;
                 for (int h : handles) {
                     try {
                         PtpIpClient.ObjectInfo oi = st.client.getObjectInfo(h);
-                        if (oi.format == 0x3001) continue; // 文件夹/关联对象跳过
+                        if (oi.format == 0x3001) { folderSkip++; continue; } // 文件夹/关联对象跳过
                         list.add(new PhotoItem(h, oi));
+                        infoOk++;
                     } catch (Exception e) {
-                        Diag.op("PTP", "GetObjectInfo 失败 handle=0x" + Integer.toHexString(h) + "：" + e.getMessage());
+                        int rc = e instanceof PtpIpClient.PtpException
+                                ? ((PtpIpClient.PtpException) e).responseCode : -1;
+                        infoFail++;
+                        if (firstFailMsg == null) { firstFailRc = rc; firstFailMsg = e.getMessage(); }
+                        Diag.op("PTP", "GetObjectInfo 失败 handle=0x" + Integer.toHexString(h)
+                                + " rc=0x" + Integer.toHexString(rc) + "：" + e.getMessage() + "（占位保留，不丢弃整表）");
+                        PtpIpClient.ObjectInfo ph = new PtpIpClient.ObjectInfo();
+                        ph.filename = "未知文件（0x" + Integer.toHexString(h) + "）";
+                        PhotoItem item = new PhotoItem(h, ph);
+                        item.infoFailed = true;
+                        item.infoFailRc = rc;
+                        list.add(item);
                     }
                     if (++done % 100 == 0) Diag.op("PTP", "ObjectInfo 进度 " + done + "/" + handles.length);
                 }
+                Diag.op("PTP", "照片枚举汇总：原始句柄 " + handles.length + " 个，信息成功 " + infoOk
+                        + "，失败 " + infoFail + "（占位保留）"
+                        + (firstFailMsg != null ? "，首个失败 rc=0x" + Integer.toHexString(firstFailRc) + "：" + firstFailMsg : "")
+                        + (folderSkip > 0 ? "，文件夹跳过 " + folderSkip : ""));
                 Collections.sort(list, (a, b) -> b.sortKey().compareTo(a.sortKey())); // 新→旧
                 int dlCount = 0;
                 for (PhotoItem p : list) {
@@ -3155,12 +3246,28 @@ public class MainActivity extends Activity {
                 }
                 st.photos.clear();
                 st.photos.addAll(list);
+                // v0.6.1：为空必须给出具体原因（空状态卡显示），禁止静默空白
+                if (list.isEmpty()) {
+                    photoLoadNote = handles.length == 0
+                            ? "相机返回 0 个对象：卡上没有照片，或当前连接方式下相机未开放照片访问（可换另一种连接方式再试）；细节见诊断页。"
+                            : "相机返回 " + handles.length + " 个对象，但全部是文件夹、没有照片文件；细节见诊断页。";
+                } else if (infoFail > 0 && infoOk == 0) {
+                    photoLoadNote = null; // 占位条目已进列表，数量与原因在条目上可见，不再占空状态
+                    Diag.op("PTP", "照片信息全部读取失败，已以占位条目保留 " + list.size() + " 条（首个失败码 0x"
+                            + Integer.toHexString(firstFailRc) + "）");
+                } else {
+                    photoLoadNote = null;
+                }
                 Diag.op("PTP", "照片列表就绪：" + list.size() + " 张（其中已下载 " + dlCount + " 张，据已下载记录 "
                         + DownloadRecord.count() + " 条比对）");
                 runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); updateAutoUi(); });
             } catch (Exception e) {
                 Diag.op("PTP", "读取照片失败：" + e.getMessage());
-                runOnUiThread(() -> Toast.makeText(this, "读取失败：" + e.getMessage(), Toast.LENGTH_SHORT).show());
+                photoLoadNote = "读取照片失败：" + e.getMessage() + "（细节见诊断页）";
+                runOnUiThread(() -> {
+                    rebuildDisplay(); updateSelInfo();
+                    Toast.makeText(this, "读取失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
+                });
             }
         });
     }
@@ -3186,8 +3293,13 @@ public class MainActivity extends Activity {
 
     private void onDownloadClicked() {
         List<DownloadService.Job> jobs = new ArrayList<>();
+        int skippedFailed = 0;
         for (PhotoItem p : selectedFiles()) {
+            if (p.infoFailed) { skippedFailed++; continue; } // v0.6.1：占位条目不入队，给中文提示
             jobs.add(new DownloadService.Job(p.handle, p.filename(), p.size()));
+        }
+        if (skippedFailed > 0) {
+            Toast.makeText(this, "有 " + skippedFailed + " 张照片信息读取失败，已跳过（细节见诊断页）", Toast.LENGTH_LONG).show();
         }
         if (jobs.isEmpty()) { Toast.makeText(this, "先勾选要下载的照片", Toast.LENGTH_SHORT).show(); return; }
         if (Build.VERSION.SDK_INT <= 28
@@ -3313,23 +3425,30 @@ public class MainActivity extends Activity {
                 badge2Iv.setVisibility(View.GONE);
             }
             // 缩略图：缓存命中直接用；未命中先放矢量占位（格式徽标放大），异步加载回来再换
-            Bitmap bmp = thumbCache.getMem(thumbItem.handle);
+            // v0.6.1：信息读取失败的占位条目不发缩略图请求（句柄信息不全），角标直接标原因
+            Bitmap bmp = thumbItem.infoFailed ? null : thumbCache.getMem(thumbItem.handle);
             thumbIv.setTag(thumbItem.handle);
+            if (thumbItem.infoFailed) {
+                chipTv.setText("信息读取失败");
+                chipTv.setTextColor(Ui.ERR);
+            }
             if (bmp != null) {
                 thumbIv.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 thumbIv.setImageBitmap(bmp);
             } else {
                 thumbIv.setScaleType(ImageView.ScaleType.CENTER);
                 thumbIv.setImageDrawable(icon(badgeResOf(thumbItem.kind()), Ui.TEXT_DIM));
-                final ImageView target = thumbIv;
-                thumbCache.load(AppState.get().client, thumbItem.handle, AppState.get().profile,
-                        (handle, bitmap) -> runOnUiThread(() -> {
-                            Object tag = target.getTag();
-                            if (tag instanceof Integer && (Integer) tag == handle) {
-                                target.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                                target.setImageBitmap(bitmap);
-                            }
-                        }));
+                if (!thumbItem.infoFailed) {
+                    final ImageView target = thumbIv;
+                    thumbCache.load(AppState.get().client, thumbItem.handle, AppState.get().profile,
+                            (handle, bitmap) -> runOnUiThread(() -> {
+                                Object tag = target.getTag();
+                                if (tag instanceof Integer && (Integer) tag == handle) {
+                                    target.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                                    target.setImageBitmap(bitmap);
+                                }
+                            }));
+                }
             }
             return cell;
         }

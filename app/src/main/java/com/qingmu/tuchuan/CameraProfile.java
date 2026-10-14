@@ -51,7 +51,8 @@ public final class CameraProfile {
 
     public static final CameraProfile Z_50_30 = new CameraProfile(
             "Z_50_30", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
-            "Z 50/Z 30 等与 Z fc 同代机型，入口相同，标准协议兼容、待真机验证");
+            "Z 50/Z 30 与 Z fc 同代 Z 系 FULL 档。Z 30 数据来源：外部用户 2026-10-14 在 v0.6.0 实测——AP 连接、遥控拍照可用；"
+            + "手选清晰档被打回、照片枚举回 0、STA 点按钮退出三项已在 v0.6.1 针对性热修（待复测）；Z 50 本体待真机验证");
 
     public static final CameraProfile Z_FULLFRAME = new CameraProfile(
             "Z_FULLFRAME", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,

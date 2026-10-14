@@ -101,6 +101,9 @@ public class RemoteController {
     private volatile boolean lvSizeSupported = false;
     private volatile List<Integer> lvSizeValues = new ArrayList<>();
     private volatile int lvSizeIdx = -1; // -1 = 未知/相机默认
+    // v0.6.1：用户手动选定的帧尺寸在本会话内锁定——自适应只许降呈现帧率、不许动尺寸
+    // （Z 30 外部实测：手选 XGA 清晰档总被自适应降尺寸打回 QVGA。默认/未手动选过时才保留自动降尺寸）
+    private volatile boolean lvSizeManual = false;
     // 帧率档：只降不升，会话内防震荡
     private static final int[] FPS_TIERS = {30, 24, 20, 15};
     private volatile int fpsTierIdx = 0;
@@ -473,6 +476,7 @@ public class RemoteController {
      * 相机不提供该属性时尺寸不可调，自适应只走降帧率档路线，诊断注明。
      */
     public void queryLvSize() {
+        lvSizeManual = false; // 新会话回到默认状态：未手动选过，自适应可降尺寸
         exec.execute(() -> {
             try {
                 PtpIpClient.DevicePropDesc d = client.getDevicePropDesc(PtpIpClient.PROP_NIKON_LIVE_VIEW_IMAGE_SIZE);
@@ -522,6 +526,8 @@ public class RemoteController {
             Diag.op("LIVEVIEW", "手动切档 → " + lvSizeName(v) + "（值 " + v + "）rc=0x" + Integer.toHexString(rc));
             if (rc == PtpIpClient.RC_OK) {
                 lvSizeIdx = idx;
+                lvSizeManual = true; // v0.6.1：手动选定即锁定，本会话自适应不再动尺寸
+                Diag.op("LIVEVIEW", "帧尺寸已手动锁定为 " + lvSizeName(v) + "，本会话自适应只降帧率不降尺寸");
                 fpsTierIdx = 0;
                 lvNote = null;
                 pushLvSizesUi();
@@ -781,6 +787,8 @@ public class RemoteController {
      * 仍判不稳的三种情况：①呈现间隔抖动 σ 超间隔 0.6（真抖，宁降档不抖）；②拉帧跟不上且呈现 fps<目标 93%；
      * ③拉帧跟得上但呈现 fps 跌破目标 80%（解码/呈现侧真出问题）。连续 2 窗不稳 → 降档：
      * 30fps 档时先降帧尺寸（保帧率牺牲分辨率）；尺寸已最低或帧率档已降过，则降帧率档（30→24→20→15）。
+     * v0.6.1：用户手动选定的帧尺寸在本会话锁定（lvSizeManual）——降档只走降帧率，不许动尺寸；
+     * 每次降档决策单独打一行 [LIVEVIEW] 自动降档决策（触发指标 + 动作），供下轮看他机（如 Z 30）真实拉帧数据。
      * 返回新的 unstableStreak。
      */
     private int evaluateStability(double fps, List<Float> ivs, int streak,
@@ -810,18 +818,27 @@ public class RemoteController {
             return 0;
         }
         streak++;
+        String trigger;
+        if (jittery) trigger = "呈现抖动（σ " + String.format("%.1f", std) + "ms > 间隔×0.6）";
+        else if (pullKnown && !pullKeepsUp) trigger = "拉帧跟不上（往返均值 " + String.format("%.1f", pullMeanMs)
+                + "ms p95 " + pullP95Ms + "ms，呈现 " + String.format("%.1f", fps) + "fps < 目标×0.93）";
+        else if (pullKeepsUp) trigger = "拉帧正常但呈现跌破目标×0.80（呈现侧问题）";
+        else trigger = "拉帧样本不足回退口径（呈现 " + String.format("%.1f", fps) + "fps/目标 " + target + "）";
         Diag.op("LIVEVIEW", "稳定性评估：呈现 " + String.format("%.1f", fps) + "fps/目标 " + target
                 + "，呈现间隔均值 " + String.format("%.1f", mean) + "ms 标准差 " + String.format("%.1f", std)
                 + "ms，拉帧往返均值 " + String.format("%.1f", pullMeanMs) + "ms p95 "
                 + (pullP95Ms >= 0 ? pullP95Ms + "ms" : "样本不足") + "（" + (pullKeepsUp ? "拉帧跟得上" : "拉帧跟不上")
                 + "）→ 不稳观察 " + streak + "/2");
         if (streak < 2) return streak;
-        if (target == FPS_TIERS[0] && lvSizeSupported && lvSizeIdx > 0) {
+        boolean sizeDropWanted = target == FPS_TIERS[0] && lvSizeSupported && lvSizeIdx > 0;
+        if (sizeDropWanted && !lvSizeManual) {
             final int newIdx = lvSizeIdx - 1;
             final int v = lvSizeValues.get(newIdx);
             lvSizeIdx = newIdx;
             lvNote = "帧率不稳，已自动降至 " + lvSizeName(v) + " 档锁定 " + target + "fps";
             Diag.op("LIVEVIEW", "自适应降档（保帧率先牺牲分辨率）：尺寸 → " + lvSizeName(v) + "（值 " + v + "）");
+            Diag.op("LIVEVIEW", "自动降档决策：触发=" + trigger + "；尺寸处于默认状态（未手动锁定），动作=降尺寸至 "
+                    + lvSizeName(v) + " 保 " + target + "fps");
             exec.execute(() -> {
                 int rc = client.setDevicePropValue(PtpIpClient.PROP_NIKON_LIVE_VIEW_IMAGE_SIZE,
                         new PtpIpClient.PropValue(lvSizeDatatype, v));
@@ -832,8 +849,14 @@ public class RemoteController {
             fpsTierIdx++;
             lvNote = "帧率不稳，已改为锁定 " + targetFps() + "fps 均匀呈现";
             Diag.op("LIVEVIEW", "自适应锁档（保稳定降帧率）：帧率档 → " + targetFps() + "fps");
+            Diag.op("LIVEVIEW", "自动降档决策：触发=" + trigger + "；"
+                    + (sizeDropWanted && lvSizeManual
+                        ? "尺寸 " + lvSizeLabel() + " 为用户手动锁定，跳过降尺寸，动作=只降帧率至 " + targetFps() + "fps"
+                        : "动作=降帧率至 " + targetFps() + "fps（尺寸 " + lvSizeLabel() + "）"));
         } else {
             Diag.op("LIVEVIEW", "已到最低档（最小尺寸 + " + targetFps() + "fps）仍不稳，保持尽力呈现并持续监测");
+            Diag.op("LIVEVIEW", "自动降档决策：触发=" + trigger + "；已无可降档位（尺寸 " + lvSizeLabel()
+                    + (lvSizeManual ? "，用户手动锁定" : "") + " + " + targetFps() + "fps），动作=保持尽力呈现");
         }
         return 0;
     }
@@ -1208,20 +1231,31 @@ public class RemoteController {
         if (code == PtpIpClient.EC_OBJECT_ADDED && params != null && params.length >= 1) {
             final int handle = params[0];
             exec.execute(() -> {
+                // v0.6.1：ObjectInfo 与缩略图分开取——枚举/信息读取在个别机型（如 Z 30）失败时，
+                // 新照片也要能凭句柄直接进预览，不许整条链陪葬
+                PtpIpClient.ObjectInfo oi = null;
                 try {
-                    PtpIpClient.ObjectInfo oi = client.getObjectInfo(handle);
-                    // v0.3 自动回传：先于预览图判定入队（下载队列与预览各走各的通道，互不阻塞）
-                    maybeAutoTransfer(handle, oi);
+                    oi = client.getObjectInfo(handle);
+                } catch (Exception e) {
+                    int rc = e instanceof PtpIpClient.PtpException ? ((PtpIpClient.PtpException) e).responseCode : -1;
+                    Diag.op("REMOTE", "拍完即览：GetObjectInfo 失败 handle=0x" + Integer.toHexString(handle)
+                            + " rc=0x" + Integer.toHexString(rc) + "（" + e.getMessage() + "），仍尝试单独取缩略图预览");
+                }
+                // v0.3 自动回传：先于预览图判定入队（下载队列与预览各走各的通道，互不阻塞）；无 ObjectInfo 时跳过
+                if (oi != null) maybeAutoTransfer(handle, oi);
+                Bitmap bmp = null;
+                try {
                     byte[] thumb = client.getThumb(handle);
-                    Bitmap bmp = thumb != null && thumb.length > 0
+                    bmp = thumb != null && thumb.length > 0
                             ? ThumbCache.orientByExif(BitmapFactory.decodeByteArray(thumb, 0, thumb.length), thumb)
                             : null; // v0.5：与网格缩略图同一口径按 EXIF 方向转正（仅显示位图）
-                    Diag.op("REMOTE", "拍完即览：新对象 0x" + Integer.toHexString(handle) + " "
-                            + oi.filename + " 缩略图 " + (bmp != null ? bmp.getWidth() + "x" + bmp.getHeight() : "无"));
-                    ui.onNewPhoto(handle, bmp, oi.filename);
                 } catch (Exception e) {
-                    Diag.op("REMOTE", "拍完即览拉取失败 handle=0x" + Integer.toHexString(handle) + "：" + e.getMessage());
+                    Diag.op("REMOTE", "拍完即览：GetThumb 失败 handle=0x" + Integer.toHexString(handle) + "：" + e.getMessage());
                 }
+                String fname = oi != null ? oi.filename : "新照片（信息读取失败）";
+                Diag.op("REMOTE", "拍完即览：新对象 0x" + Integer.toHexString(handle) + " "
+                        + fname + " 缩略图 " + (bmp != null ? bmp.getWidth() + "x" + bmp.getHeight() : "无"));
+                ui.onNewPhoto(handle, bmp, fname);
             });
         } else if (code == PtpIpClient.EC_CAPTURE_COMPLETE) {
             ui.onStatus("拍摄完成，照片已写入存储卡");

@@ -6,6 +6,10 @@ public class PhotoItem {
     public final PtpIpClient.ObjectInfo info;
     public boolean selected = false;
     public boolean downloaded = false;
+    /** v0.6.1：GetObjectInfo 失败的占位条目（句柄真实存在、信息读不到）——列表数量与相机一致，缩略图/下载给中文失败提示 */
+    public boolean infoFailed = false;
+    /** v0.6.1：占位条目的信息读取失败响应码（进提示与诊断） */
+    public int infoFailRc = -1;
 
     public PhotoItem(int handle, PtpIpClient.ObjectInfo info) {
         this.handle = handle; this.info = info;
