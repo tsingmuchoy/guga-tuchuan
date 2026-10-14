@@ -10,6 +10,7 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 
@@ -29,17 +30,40 @@ import java.io.OutputStream;
  *    峰值 ≈ 输出图本身（24MP ARGB 约 96MB；Z fc 的 20.9MP 约 83MB）+ 一条条带。
  *    若整图分配 OOM，自动降到 1/2、1/4 尺寸导出并在结果里如实注明（不静默缩水）。
  *  - 成品只在用户点「保存」时落盘；原图永不覆盖，成品进 Pictures/QingmuTuchuan/Edited。
+ *
+ * v0.4.3：①导出 JPEG 质量改为可选项（编辑页三档 100/97/88，默认 97；v0.4.2 及以前写死 92，
+ *   外部用户实测 20.7MP 原图 8.02MB 经出片只剩 3.07MB、画质损失明显）；
+ *   ②成品回写源图 EXIF 白名单（机型/镜头/光圈/快门/ISO/焦距/时间/曝光补偿/白平衡/GPS 等），
+ *   在 AlbumSaver 清除 IS_PENDING 之前经 AfterWriteHook 完成，失败只记诊断、不拖垮导出。
+ *   说明：Bitmap.compress 的色度抽样（4:2:0）由系统编码器固定、应用层不可控，即便质量 100
+ *   也存在二次编码的理论损失下限——目标是把它压到肉眼基本不可感，而不是宣称无损。
  */
 public final class ImageEditor {
 
     private static final int STRIP_ROWS = 384;
-    private static final int JPEG_QUALITY = 92;
+
+    /** EXIF 回写白名单：只带这些标签；缩略图、ImageWidth/Length、厂商 MakerNote 等一律不带，防过期数据 */
+    private static final String[] EXIF_WHITELIST = {
+            "Make", "Model", "LensMake", "LensModel",
+            "FNumber", "ExposureTime", "ISOSpeedRatings", "PhotographicSensitivity",
+            "FocalLength", "FocalLengthIn35mmFilm",
+            "DateTime", "DateTimeOriginal", "DateTimeDigitized",
+            "OffsetTime", "OffsetTimeOriginal", "OffsetTimeDigitized",
+            "ExposureBiasValue", "WhiteBalance", "ExposureProgram", "ExposureMode",
+            "MeteringMode", "Flash", "SceneCaptureType",
+            "BrightnessValue", "MaxApertureValue", "SubjectDistance", "DigitalZoomRatio",
+            "Contrast", "Saturation", "Sharpness", "GainControl",
+            "GPSVersionID", "GPSLatitudeRef", "GPSLatitude", "GPSLongitudeRef", "GPSLongitude",
+            "GPSAltitudeRef", "GPSAltitude", "GPSTimeStamp", "GPSDateStamp",
+            "GPSProcessingMethod", "GPSImgDirectionRef", "GPSImgDirection",
+    };
 
     public static class ExportResult {
         public Uri uri;
         public String displayName;
         public int width, height;
         public boolean scaledDown; // 内存不足降尺寸导出时为 true（结果文案必须注明）
+        public long fileBytes;     // 成品 JPEG 字节数（v0.4.3 起随诊断记录，便于核对画质档效果）
     }
 
     private ImageEditor() {}
@@ -109,7 +133,8 @@ public final class ImageEditor {
     // ---------- 全尺寸导出（条带化解码） ----------
 
     public static ExportResult exportFull(Context ctx, Uri srcUri, int template, int filterIdx,
-                                          int strength, ExifMeta meta, String srcName) throws Exception {
+                                          int strength, ExifMeta meta, String srcName,
+                                          int quality) throws Exception {
         // 1) 存储方向尺寸：优先 RegionDecoder，其次 bounds 解码
         int storedW = 0, storedH = 0;
         BitmapRegionDecoder decoder = null;
@@ -142,7 +167,8 @@ public final class ImageEditor {
         int dispH = swap ? storedW : storedH;
         Diag.op("EDIT", "导出开始：存储 " + storedW + "×" + storedH + "，方向 " + orientation
                 + "，显示 " + dispW + "×" + dispH + "，模板=" + Frames.NAMES[template]
-                + "，滤镜=" + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无"));
+                + "，滤镜=" + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无")
+                + "，画质=" + quality);
 
         float[] mg = Frames.margins(template);
         double[] scales = {1.0, 0.5, 0.25};
@@ -197,14 +223,15 @@ public final class ImageEditor {
 
                 File tmp = new File(ctx.getCacheDir(), "edited_tmp.jpg");
                 try (OutputStream os = new FileOutputStream(tmp)) {
-                    if (!out.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, os)) {
+                    if (!out.compress(Bitmap.CompressFormat.JPEG, quality, os)) {
                         throw new Exception("JPEG 编码失败");
                     }
                 }
                 out.recycle();
                 out = null;
+                long outBytes = tmp.length();
                 String displayName = editedName(srcName);
-                Uri uri = publishEdited(ctx, tmp, displayName);
+                Uri uri = publishEdited(ctx, tmp, displayName, srcUri);
                 //noinspection ResultOfMethodCallIgnored
                 tmp.delete();
                 ExportResult r = new ExportResult();
@@ -213,8 +240,11 @@ public final class ImageEditor {
                 r.width = outW;
                 r.height = outH;
                 r.scaledDown = scale < 1.0;
+                r.fileBytes = outBytes;
                 Diag.op("EDIT", "导出成功：" + displayName + "（" + outW + "×" + outH
                         + (r.scaledDown ? "，内存不足已降至 " + (int) (scale * 100) + "% 尺寸" : "，全尺寸")
+                        + "，画质=" + quality + "，成品="
+                        + String.format(java.util.Locale.US, "%.2f", outBytes / 1048576.0) + "MB"
                         + "）uri=" + uri);
                 return r;
             } catch (OutOfMemoryError oom) {
@@ -231,10 +261,82 @@ public final class ImageEditor {
         throw lastErr != null ? lastErr : new Exception("导出失败");
     }
 
-    /** 发布成品到 Pictures/QingmuTuchuan/Edited（v0.4.2 起统一走 AlbumSaver，Images 集合标准流程） */
-    private static Uri publishEdited(Context ctx, File tmp, String displayName) throws Exception {
+    /**
+     * 发布成品到 Pictures/QingmuTuchuan/Edited（v0.4.2 起统一走 AlbumSaver，Images 集合标准流程）。
+     * v0.4.3：经 AfterWriteHook 在成品对外可见前（scoped 分支为 IS_PENDING 清除前）回写源图 EXIF。
+     */
+    private static Uri publishEdited(Context ctx, File tmp, String displayName, final Uri srcUri) throws Exception {
         return AlbumSaver.saveToAlbum(ctx, tmp, displayName, "image/jpeg",
-                "Pictures/QingmuTuchuan/Edited", true);
+                "Pictures/QingmuTuchuan/Edited", true,
+                (c, destUri, destFile) -> copyExifWhitelist(c, srcUri, destUri, destFile));
+    }
+
+    /**
+     * v0.4.3：把源图 EXIF 白名单标签复制到成品，并把 Orientation 置 1（导出已把方向烘焙进像素）。
+     * destUri 非空（API 29+）：openFileDescriptor(uri,"rw") + ExifInterface(FileDescriptor) 回写；
+     * destFile 非空（API 26–28）：ExifInterface(文件路径) 同理回写。
+     * 源图无 EXIF（截图类导入图）则跳过并记一行；任何失败只记 [EDIT] 诊断，绝不让导出整体失败。
+     */
+    static void copyExifWhitelist(Context ctx, Uri srcUri, Uri destUri, File destFile) {
+        try {
+            java.util.LinkedHashMap<String, String> attrs = new java.util.LinkedHashMap<>();
+            try (InputStream in = ctx.getContentResolver().openInputStream(srcUri)) {
+                if (in == null) {
+                    Diag.op("EDIT", "EXIF 回写跳过：源图打不开");
+                    return;
+                }
+                ExifInterface src = new ExifInterface(in);
+                for (String tag : EXIF_WHITELIST) {
+                    try {
+                        String v = src.getAttribute(tag);
+                        if (v != null && !v.isEmpty()) attrs.put(tag, v);
+                    } catch (Exception ignore) {}
+                }
+            }
+            if (attrs.isEmpty()) {
+                Diag.op("EDIT", "EXIF 回写跳过：源图无 EXIF（白名单标签一条都没读到）");
+                return;
+            }
+            attrs.put("Orientation", "1");
+            ExifInterface dest;
+            ParcelFileDescriptor pfd = null;
+            if (destUri != null) {
+                pfd = ctx.getContentResolver().openFileDescriptor(destUri, "rw");
+                if (pfd == null) {
+                    Diag.op("EDIT", "EXIF 回写失败（不影响成品）：成品 openFileDescriptor 返回 null");
+                    return;
+                }
+                dest = new ExifInterface(pfd.getFileDescriptor());
+            } else if (destFile != null) {
+                dest = new ExifInterface(destFile.getAbsolutePath());
+            } else {
+                return;
+            }
+            int ok = 0, fail = 0;
+            StringBuilder failTags = new StringBuilder();
+            for (java.util.Map.Entry<String, String> e : attrs.entrySet()) {
+                try {
+                    dest.setAttribute(e.getKey(), e.getValue());
+                    ok++;
+                } catch (Exception ex) {
+                    fail++;
+                    if (failTags.length() > 0) failTags.append(',');
+                    failTags.append(e.getKey());
+                }
+            }
+            try {
+                dest.saveAttributes();
+            } catch (Exception se) {
+                Diag.op("EDIT", "EXIF 回写失败（不影响成品）：saveAttributes 异常：" + se);
+                try { if (pfd != null) pfd.close(); } catch (Exception ignore) {}
+                return;
+            }
+            try { if (pfd != null) pfd.close(); } catch (Exception ignore) {}
+            Diag.op("EDIT", "EXIF 回写完成：复制 " + ok + " 项"
+                    + (fail > 0 ? "，失败 " + fail + " 项（" + failTags + "）" : ""));
+        } catch (Exception e) {
+            Diag.op("EDIT", "EXIF 回写失败（不影响成品）：" + e);
+        }
     }
 
     /** 把原始异常翻成用户可读中文：原始英文报错只进诊断日志，不再整段弹到界面上 */

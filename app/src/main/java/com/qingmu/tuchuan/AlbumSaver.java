@@ -26,10 +26,19 @@ import java.io.OutputStream;
  * pending 语义只由 IS_PENDING 字段实现，不再用拼 .pending 文件名的土办法。
  *
  * API 26–28：直写公共 Pictures 目录 + MediaStore 登记 / scanFile（旧逻辑已确认正确，保留语义）。
+ *
+ * v0.4.3：新增 AfterWriteHook——保存完成、成品对外可见之前回调一次（scoped 分支在 IS_PENDING
+ * 清除前以目标 Uri 回调，legacy 分支以目标文件回调），供出片回写 EXIF 等元数据；
+ * 回调异常只记诊断并吞掉，绝不拖垮保存本身。下载路径不传 hook，行为不变。
  */
 public final class AlbumSaver {
 
     private AlbumSaver() {}
+
+    /** 保存后、对外可见前的元数据回调（scoped 传 uri、legacy 传 file，另一参数为 null） */
+    public interface AfterWriteHook {
+        void afterWrite(Context ctx, Uri uri, File file);
+    }
 
     /**
      * 把 src 文件发布到相册 relPath 目录，返回可分享的 content Uri（低版本尽力而为）。
@@ -39,10 +48,15 @@ public final class AlbumSaver {
      */
     public static Uri saveToAlbum(Context ctx, File src, String displayName, String mime,
                                   String relPath, boolean unique) throws Exception {
+        return saveToAlbum(ctx, src, displayName, mime, relPath, unique, null);
+    }
+
+    public static Uri saveToAlbum(Context ctx, File src, String displayName, String mime,
+                                  String relPath, boolean unique, AfterWriteHook hook) throws Exception {
         if (Build.VERSION.SDK_INT >= 29) {
-            return saveScoped(ctx, src, displayName, mime, relPath);
+            return saveScoped(ctx, src, displayName, mime, relPath, hook);
         }
-        return saveLegacy(ctx, src, displayName, mime, relPath, unique);
+        return saveLegacy(ctx, src, displayName, mime, relPath, unique, hook);
     }
 
     /** 集合按 mime 分流：video/* → Video，image/*（含 NEF）与其余 → Images */
@@ -54,7 +68,7 @@ public final class AlbumSaver {
     }
 
     private static Uri saveScoped(Context ctx, File src, String displayName, String mime,
-                                  String relPath) throws Exception {
+                                  String relPath, AfterWriteHook hook) throws Exception {
         ContentValues v = new ContentValues();
         v.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
         v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
@@ -67,6 +81,11 @@ public final class AlbumSaver {
                  OutputStream out = ctx.getContentResolver().openOutputStream(uri)) {
                 if (out == null) throw new Exception("MediaStore openOutputStream 返回 null");
                 copy(in, out);
+            }
+            if (hook != null) {
+                // 仍处 IS_PENDING=1 阶段：回调回写 EXIF 等元数据；回调失败不拖垮保存
+                try { hook.afterWrite(ctx, uri, null); }
+                catch (Exception he) { Diag.op("SAVE", "保存后回调异常（忽略，不影响成品）：" + he); }
             }
             v.clear();
             v.put(MediaStore.MediaColumns.IS_PENDING, 0);
@@ -81,7 +100,7 @@ public final class AlbumSaver {
     }
 
     private static Uri saveLegacy(Context ctx, File src, String displayName, String mime,
-                                  String relPath, boolean unique) throws Exception {
+                                  String relPath, boolean unique, AfterWriteHook hook) throws Exception {
         String sub = relPath.startsWith("Pictures/")
                 ? relPath.substring("Pictures/".length()) : relPath;
         File destDir = new File(Environment.getExternalStoragePublicDirectory(
@@ -92,6 +111,10 @@ public final class AlbumSaver {
         try (InputStream in = new FileInputStream(src);
              OutputStream out = new FileOutputStream(dest)) {
             copy(in, out);
+        }
+        if (hook != null) {
+            try { hook.afterWrite(ctx, null, dest); }
+            catch (Exception he) { Diag.op("SAVE", "保存后回调异常（忽略，不影响成品）：" + he); }
         }
         Uri uri = null;
         if (mime != null && mime.startsWith("image/")) {

@@ -2,6 +2,7 @@ package com.qingmu.tuchuan;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Typeface;
@@ -49,6 +50,11 @@ public class EditorActivity extends Activity {
     private int template = Frames.WHITE;
     private int filterIdx = -1;     // -1=原图
     private int strength = 100;
+    // v0.4.3：导出画质三档（默认 97），选择持久化到 prefs 的 edit_quality
+    private static final int[] QUALITY_VALUES = {100, 97, 88};
+    private static final String[] QUALITY_LABELS = {"高画质 100", "高质量 97", "省空间 88"};
+    private int quality = 97;
+    private final List<TextView> qualityChips = new ArrayList<>();
 
     private Uri savedUri;
     private boolean dirty = true;   // 当前设置尚未保存
@@ -78,6 +84,8 @@ public class EditorActivity extends Activity {
         srcUri = getIntent().getData();
         String n = getIntent().getStringExtra("name");
         if (n != null && !n.isEmpty()) srcName = n;
+        int savedQ = getSharedPreferences("guga_tuchuan", MODE_PRIVATE).getInt("edit_quality", 97);
+        for (int q : QUALITY_VALUES) if (q == savedQ) quality = q; // 非法值回落默认 97
         buildUi();
         if (srcUri == null) {
             statusTv.setText("没有收到照片（入口参数缺失），请回照片页重新点「出片」");
@@ -244,7 +252,7 @@ public class EditorActivity extends Activity {
         FrameLayout panelFrame = new FrameLayout(this);
         panelFrame.setBackground(getDrawable(R.drawable.bg_card));
         LinearLayout.LayoutParams pflp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(152));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(170)); // v0.4.3：保存页签多了画质行，三页签共用高度小幅上调
         pflp.setMargins(0, dp(4), 0, 0);
         root.addView(panelFrame, pflp);
         toolPanels[0] = buildFramePanel();
@@ -449,11 +457,43 @@ public class EditorActivity extends Activity {
         }
     }
 
+    private void refreshQualityChips() {
+        for (int i = 0; i < qualityChips.size(); i++) {
+            styleChip(qualityChips.get(i), QUALITY_VALUES[i] == quality);
+        }
+    }
+
     private View buildSavePanel() {
         LinearLayout col = panelCol();
+        // v0.4.3：导出画质三档（自绘胶囊，样式与边框/滤镜选项一致），选择即持久化
+        LinearLayout qrow = new LinearLayout(this);
+        qrow.setGravity(Gravity.CENTER_VERTICAL);
+        qrow.addView(txt("导出画质", 13, Ui.TEXT_DIM, false));
+        for (int i = 0; i < QUALITY_VALUES.length; i++) {
+            final int q = QUALITY_VALUES[i];
+            TextView c = chip(QUALITY_LABELS[i]);
+            c.setOnClickListener(v -> {
+                quality = q;
+                dirty = true; // 已保存的成品是旧画质，分享前需按新画质重导
+                getSharedPreferences("guga_tuchuan", MODE_PRIVATE).edit()
+                        .putInt("edit_quality", q).apply();
+                refreshQualityChips();
+                Diag.op("EDIT", "导出画质 → " + q);
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(dp(8), 0, 0, 0);
+            qrow.addView(c, lp);
+            qualityChips.add(c);
+        }
+        col.addView(qrow);
+        refreshQualityChips();
         saveInfoTv = txt("成品保存到相册 QingmuTuchuan/Edited，文件名 " + ImageEditor.editedName(srcName)
-                + "；原图不覆盖。导出为原图全尺寸重算，24MP 约需十几秒。", 12, Ui.TEXT_DIM, false);
-        col.addView(saveInfoTv);
+                + "；原图不覆盖。导出为原图全尺寸重算，24MP 约需十几秒；成品会带回原图 EXIF 参数。", 12, Ui.TEXT_DIM, false);
+        LinearLayout.LayoutParams silp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        silp.setMargins(0, dp(8), 0, 0);
+        col.addView(saveInfoTv, silp);
         LinearLayout row = new LinearLayout(this);
         saveBtn = btn("保存到相册", R.drawable.ic_save, true);
         shareBtn = btn("分享", R.drawable.ic_share, false);
@@ -511,13 +551,14 @@ public class EditorActivity extends Activity {
         exportBar.setVisibility(View.VISIBLE);
         exportTv.setText("正在按原图全尺寸导出…");
         Diag.op("EDIT", "开始导出（模板=" + Frames.NAMES[template] + "，滤镜="
-                + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无") + "）");
-        final int tpl = template, fidx = filterIdx, str = strength;
+                + (filterIdx >= 0 ? Filters.NAMES[filterIdx] + " " + strength + "%" : "无")
+                + "，画质=" + quality + "）");
+        final int tpl = template, fidx = filterIdx, str = strength, q = quality;
         final ExifMeta m = meta;
         bg.execute(() -> {
             try {
                 final ImageEditor.ExportResult r = ImageEditor.exportFull(
-                        EditorActivity.this, srcUri, tpl, fidx, str, m, srcName);
+                        EditorActivity.this, srcUri, tpl, fidx, str, m, srcName, q);
                 runOnUiThread(() -> {
                     exporting = false;
                     saveBtn.setEnabled(true);
