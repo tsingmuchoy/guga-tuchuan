@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 大快门内圆：尼康黄实心（v0.5 相机式底部控制栏） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#FFDE00" />
+</shape>

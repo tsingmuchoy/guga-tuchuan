@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!-- 直方图：四根高低柱 + 底线（v0.5 遥控页浮层开关） -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M3.5,19.6 L20.5,19.6 L20.5,21 L3.5,21 Z M4.8,11.5 L7.2,11.5 L7.2,19.6 L4.8,19.6 Z M8.7,6 L11.1,6 L11.1,19.6 L8.7,19.6 Z M12.6,9.2 L15,9.2 L15,19.6 L12.6,19.6 Z M16.5,13.8 L18.9,13.8 L18.9,19.6 L16.5,19.6 Z"/>
+</vector>

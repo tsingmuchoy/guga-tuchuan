@@ -145,6 +145,8 @@ public class PtpIpClient {
         public String manufacturer = "", model = "", version = "", serial = "";
         public int functionalMode;
         public List<Integer> operationsSupported = new ArrayList<>();
+        /** 相机自报支持的设备属性码全集（DeviceInfo 数据集原有字段，v0.5 起存下供参数面板全量枚举；解析位置不变、无协议行为变化） */
+        public List<Integer> devicePropertiesSupported = new ArrayList<>();
     }
 
     public static class StorageInfo {
@@ -622,7 +624,7 @@ public class PtpIpClient {
         di.functionalMode = c.u16();
         di.operationsSupported = c.u16Array();
         c.u16Array(); // events
-        c.u16Array(); // device properties
+        di.devicePropertiesSupported = c.u16Array(); // device properties（v0.5：原样存下供全量参数面板枚举）
         c.u16Array(); // capture formats
         c.u16Array(); // image formats
         di.manufacturer = c.str();

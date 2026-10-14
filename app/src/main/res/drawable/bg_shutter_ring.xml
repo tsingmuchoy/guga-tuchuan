@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 大快门外环：透明底 + 尼康黄粗描边（v0.5 相机式底部控制栏） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#00000000" />
+    <stroke android:width="3dp" android:color="#FFDE00" />
+</shape>

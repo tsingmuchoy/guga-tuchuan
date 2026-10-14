@@ -36,7 +36,8 @@ public class RemoteController {
     public static final String F_MOVIE = "movie";
 
     public interface Ui {
-        void onProps(List<PropItem> items, String remainText);
+        /** 全量属性面板数据（v0.5：相机自报全部属性 + 剩余张数文案 + 电量百分比，电量读不到为 -1） */
+        void onProps(List<PropItem> items, String remainText, int battery);
         void onPropUpdated(PropItem item, boolean ok, String msg);
         void onFrame(Bitmap bmp, float fps);
         void onHistogram(float[][] bins); // [3][64]，0..1 归一化
@@ -103,6 +104,11 @@ public class RemoteController {
     // 流水线窗口统计（各自线程写、呈现线程 5 秒汇总时读后清零；非原子读清，统计用途允许个位数误差）
     private volatile int pullWinCount = 0, decodeWinCount = 0;
     private volatile long pullWinSumRt = 0, decodeWinSum = 0;
+    // v0.5 呈现档判定新口径的样本：拉帧往返耗时（拉帧是请求-响应背靠背，其往返即拉帧间隔的近似）。
+    // 拉帧线程往两个窗口各塞一份，呈现线程在 2s 评估 / 5s 汇总时各自快照清零；判定改看拉帧 p95，不再只看呈现 fps。
+    private final List<Long> pullRtEval = new ArrayList<>();
+    private final List<Long> pullRtWin5 = new ArrayList<>();
+    private volatile long lastPullP95Ms = -1;
     private volatile long lastConsumedSeq = 0, lastShownSeq = 0;
     private volatile int lvSizeDatatype = PtpIpClient.DTC_UINT8;
     private volatile float lastDisplayFps = 0;
@@ -110,6 +116,8 @@ public class RemoteController {
     private volatile boolean recording = false;
     private long lastPropRefreshMs = 0;
     private volatile int storageId = 0;
+    /** 相机 DeviceInfo 自报支持的属性码全集（连接装配时由上层注入；为空则参数面板回退到 CamProps 目录试探） */
+    private volatile List<Integer> supportedPropCodes = new ArrayList<>();
 
     // ---- v0.3 拍完自动回传（事件驱动） ----
     /**
@@ -134,6 +142,11 @@ public class RemoteController {
     public boolean isAutoTransferOn() { return autoTransferEnabled; }
 
     public void setStorageId(int storageId) { this.storageId = storageId; }
+
+    /** 注入相机自报的属性码全集（DeviceInfo.devicePropertiesSupported），参数面板据此全量枚举 */
+    public void setSupportedPropCodes(List<Integer> codes) {
+        supportedPropCodes = codes != null ? new ArrayList<>(codes) : new ArrayList<>();
+    }
 
     public RemoteController(PtpIpClient client, CameraProfile profile, boolean experimental, Ui ui) {
         this.client = client;
@@ -186,21 +199,58 @@ public class RemoteController {
 
     // ---------- 状态面板 / 参数 ----------
 
+    /**
+     * 全量读取相机属性（v0.5 起）：枚举范围 = 相机 DeviceInfo 自报支持的属性码全集
+     * （上层经 setSupportedPropCodes 注入）∪ 经典 DEFS，逐个 GetDevicePropDesc；
+     * 相机没报告支持列表时回退到 CamProps 目录逐个试探（读不到的即视为无此属性）。
+     * 0xD1AC 显式跳过：取景帧尺寸由尺寸档开关 + 本类状态机专管，面板再开写入入口会状态脱同步。
+     * 返回顺序：按 CamProps 分组（曝光/对焦/图像/视频/其他）→ 组内目录序 → 未知码升序，
+     * UI 层直接顺序渲染即可。读取失败项：权威列表（相机自报）里的保留为置灰行，回退试探的直接略过。
+     */
     public void loadProps(final int storageId) {
         if (!featureAllowed(F_PROPS_READ)) { ui.onStatus("状态面板被机型 profile 锁定"); return; }
         exec.execute(() -> {
-            List<PropItem> items = new ArrayList<>();
-            for (CamProps.Def def : CamProps.DEFS) {
-                PropItem it = new PropItem();
-                it.def = def;
+            boolean authoritative = !supportedPropCodes.isEmpty();
+            java.util.LinkedHashSet<Integer> codes = new java.util.LinkedHashSet<>();
+            if (authoritative) codes.addAll(supportedPropCodes);
+            else codes.addAll(CamProps.catalogCodes());
+            for (CamProps.Def d : CamProps.DEFS) codes.add(d.code); // 经典 8 项保底（相机列表偶有遗漏时仍给出置灰行）
+            codes.remove(PtpIpClient.PROP_NIKON_LIVE_VIEW_IMAGE_SIZE);
+            java.util.Map<Integer, PtpIpClient.DevicePropDesc> fetched = new java.util.HashMap<>();
+            int skipped = 0;
+            for (int code : codes) {
                 try {
-                    it.desc = client.getDevicePropDesc(def.code);
+                    fetched.put(code, client.getDevicePropDesc(code));
                 } catch (Exception e) {
-                    it.desc = null;
-                    Diag.op("REMOTE", "属性 " + def.name + "(0x" + Integer.toHexString(def.code) + ") 读取失败，面板置灰：" + e.getMessage());
+                    skipped++;
+                    if (authoritative || CamProps.DEFS.contains(CamProps.byCode(code))) {
+                        // 自报支持却读不到 desc：值得点名（面板会置灰），但只汇总记一行防刷屏
+                    }
                 }
-                items.add(it);
             }
+            List<PropItem> items = new ArrayList<>();
+            // 组装顺序：分组 → 目录序；目录外的码（厂商私有）按码升序落其他组末尾
+            List<Integer> unknown = new ArrayList<>();
+            for (int code : codes) if (CamProps.byCode(code) == null) unknown.add(code);
+            java.util.Collections.sort(unknown);
+            for (int g = 0; g < CamProps.GROUP_NAMES.length; g++) {
+                for (CamProps.Def def : CamProps.CATALOG) {
+                    if (def.group != g || !codes.contains(def.code)) continue;
+                    PropItem it = mkPropItem(def, fetched.get(def.code), authoritative);
+                    if (it != null) items.add(it);
+                }
+                if (g == CamProps.GROUP_OTHER) {
+                    for (int code : unknown) {
+                        PropItem it = mkPropItem(CamProps.defOf(code), fetched.get(code), authoritative);
+                        if (it != null) items.add(it);
+                    }
+                }
+            }
+            int got = 0;
+            for (PropItem it : items) if (it.available()) got++;
+            Diag.op("REMOTE", "全量属性读取完成：候选 " + codes.size() + " 个（来源 "
+                    + (authoritative ? "相机 DeviceInfo 自报" : "目录回退试探") + "），成功 " + got
+                    + " 个，读不到 " + skipped + " 个" + (authoritative ? "（自报项读不到的在面板置灰）" : ""));
             // 剩余可拍张数：优先存储信息里的相机估算值（GetStorageInfo 的 NumberOfImages 字段）。
             // 注：0x5013 经 libgphoto2 ptp.h 核实是连拍模式（StillCaptureMode），不是剩余张数，已在面板中按「拍摄驱动」展示。
             String remain = "未知";
@@ -211,9 +261,26 @@ public class RemoteController {
             } catch (Exception e) {
                 Diag.op("REMOTE", "剩余张数读取失败：" + e.getMessage());
             }
+            int battery = client.getBatteryLevel(); // 失败返回 -1 不抛（client 内部已吞异常）
             lastPropRefreshMs = System.currentTimeMillis();
-            ui.onProps(items, remain);
+            ui.onProps(items, remain, battery);
         });
+    }
+
+    /**
+     * 造一行属性。desc 为 null（读不到）时：相机自报支持（权威）或经典 DEFS 项 → 保留为置灰行（如实显示「相机未提供」）；
+     * 纯回退试探猜的码 → 返回 null 丢弃，避免拿猜测冒充相机属性清单。
+     */
+    private PropItem mkPropItem(CamProps.Def def, PtpIpClient.DevicePropDesc desc, boolean authoritative) {
+        if (desc == null && !authoritative) {
+            boolean classic = false;
+            for (CamProps.Def d : CamProps.DEFS) if (d.code == def.code) { classic = true; break; }
+            if (!classic) return null;
+        }
+        PropItem it = new PropItem();
+        it.def = def;
+        it.desc = desc;
+        return it;
     }
 
     public void setProp(final PropItem item, final PtpIpClient.PropValue chosen) {
@@ -312,7 +379,13 @@ public class RemoteController {
     /** 用户手动切档：smooth=true 取最小档（流畅），false 取最大档（清晰）；换尺寸后帧率档重置回 30 重新尝试锁定 */
     public void setLvSmooth(final boolean smooth) {
         if (!lvSizeSupported || lvSizeValues.isEmpty()) { ui.onStatus("相机未提供帧尺寸切换（0xD1AC）"); return; }
-        final int idx = smooth ? 0 : lvSizeValues.size() - 1;
+        setLvSizeIndex(smooth ? 0 : lvSizeValues.size() - 1);
+    }
+
+    /** v0.5：按下标切任意一档帧尺寸（面板/浮层列全相机自报的档位，不再只有最小/最大两极）；成功后帧率档重置回 30 重试锁定 */
+    public void setLvSizeIndex(final int idx) {
+        if (!lvSizeSupported || lvSizeValues.isEmpty()) { ui.onStatus("相机未提供帧尺寸切换（0xD1AC）"); return; }
+        if (idx < 0 || idx >= lvSizeValues.size()) return;
         exec.execute(() -> {
             int v = lvSizeValues.get(idx);
             int rc = client.setDevicePropValue(PtpIpClient.PROP_NIKON_LIVE_VIEW_IMAGE_SIZE,
@@ -350,6 +423,9 @@ public class RemoteController {
             frameSeq = 0; droppedRaw = 0; droppedDisp = 0;
             lastConsumedSeq = 0; lastShownSeq = 0;
             pullWinCount = 0; pullWinSumRt = 0; decodeWinCount = 0; decodeWinSum = 0;
+            synchronized (pullRtEval) { pullRtEval.clear(); }
+            synchronized (pullRtWin5) { pullRtWin5.clear(); }
+            lastPullP95Ms = -1;
             lastDisplayFps = FPS_TIERS[0];
             lvOn = true;
             ui.onLiveView(true, "取景已开启（目标：稳定 " + targetFps() + "fps）");
@@ -435,6 +511,14 @@ public class RemoteController {
             RawFrame prev = rawSlot.getAndSet(rf);
             if (prev != null && prev.seq > lastConsumedSeq) droppedRaw++; // 旧帧没等到解码就被覆盖
             pullWinCount++; pullWinSumRt += rt;
+            synchronized (pullRtEval) {
+                pullRtEval.add(rt);
+                if (pullRtEval.size() > 1200) pullRtEval.subList(0, 600).clear(); // 防异常堆积，窗口样本足够即可
+            }
+            synchronized (pullRtWin5) {
+                pullRtWin5.add(rt);
+                if (pullRtWin5.size() > 1200) pullRtWin5.subList(0, 600).clear();
+            }
         }
         Diag.op("LIVEVIEW", "拉帧线程退出（共拉 " + frameSeq + " 帧，覆盖丢弃 " + droppedRaw + " 帧）");
         ui.onLiveView(false, "取景已停止");
@@ -509,25 +593,37 @@ public class RemoteController {
                 ui.onLvState(lvSizeLabel(), targetFps(), lastDisplayFps, lvNote);
                 lvNote = null;
             }
-            // —— 自适应锁档：每约 2 秒评估呈现稳定性（帧率均值 + 帧间隔标准差） ——
+            // —— 自适应锁档：每约 2 秒评估（v0.5 起判据以拉帧 p95 间隔为主，呈现 fps/抖动为辅） ——
             if (now - evalStart >= 2000 && evalShown >= 10) {
                 double fps = evalShown * 1000.0 / (now - evalStart);
                 lastDisplayFps = (float) fps;
-                unstableStreak = evaluateStability(fps, evalIntervals, unstableStreak);
+                List<Long> rtSnap;
+                synchronized (pullRtEval) { rtSnap = new ArrayList<>(pullRtEval); pullRtEval.clear(); }
+                long p95 = p95Of(rtSnap);
+                if (p95 >= 0) lastPullP95Ms = p95;
+                double rtMean = 0;
+                for (long v : rtSnap) rtMean += v;
+                rtMean = rtSnap.isEmpty() ? 0 : rtMean / rtSnap.size();
+                unstableStreak = evaluateStability(fps, evalIntervals, unstableStreak,
+                        p95, rtMean, rtSnap.size());
                 evalStart = now; evalShown = 0; evalIntervals.clear();
             }
-            // —— 5 秒诊断汇总：能证明「稳」的数字都在这一行 ——
+            // —— 5 秒诊断汇总：能证明「稳」的数字都在这一行（v0.5 在拉帧段内补间隔p95，字段顺序不变可跨版对比） ——
             if (now - winStart >= 5000) {
                 int pulled = pullWinCount; long sumRt = pullWinSumRt;
                 int decoded = decodeWinCount; long sumDec = decodeWinSum;
                 pullWinCount = 0; pullWinSumRt = 0; decodeWinCount = 0; decodeWinSum = 0;
+                List<Long> rtWin5;
+                synchronized (pullRtWin5) { rtWin5 = new ArrayList<>(pullRtWin5); pullRtWin5.clear(); }
+                long p95w = p95Of(rtWin5);
                 long dRaw = droppedRaw - dropRawSeen; dropRawSeen = droppedRaw;
                 long dDisp = droppedDisp - dropDispSeen; dropDispSeen = droppedDisp;
                 float shownFps = shownWin * 1000f / (now - winStart);
                 lastDisplayFps = shownFps;
                 Diag.op("LIVEVIEW", "5s汇总（档位 " + lvSizeLabel() + "·" + targetFps() + "fps）：呈现 "
                         + shownWin + " 帧=" + String.format("%.1f", shownFps) + "fps｜拉帧 " + pulled
-                        + " 帧 往返均值 " + (pulled > 0 ? sumRt / pulled : 0) + "ms｜解码 " + decoded
+                        + " 帧 往返均值 " + (pulled > 0 ? sumRt / pulled : 0) + "ms 间隔p95 "
+                        + (p95w >= 0 ? p95w + "ms" : "无样本") + "｜解码 " + decoded
                         + " 帧 均值 " + (decoded > 0 ? sumDec / decoded : 0) + "ms｜呈现间隔 "
                         + intervalStats(winIntervals) + "｜丢弃 未解码 " + dRaw + " / 未呈现 " + dDisp);
                 winStart = now; shownWin = 0; winIntervals.clear();
@@ -536,13 +632,26 @@ public class RemoteController {
         Diag.op("LIVEVIEW", "呈现线程退出");
     }
 
+    /** 拉帧往返样本的 p95（样本不足返回 -1）；拉帧为请求-响应背靠背，往返即拉帧间隔近似 */
+    private static long p95Of(List<Long> samples) {
+        if (samples == null || samples.size() < 8) return -1;
+        List<Long> s = new ArrayList<>(samples);
+        java.util.Collections.sort(s);
+        return s.get(Math.min(s.size() - 1, (int) (s.size() * 0.95)));
+    }
+
     /**
      * 稳定性评估与自动降档（稳定 > 帧率 > 分辨率，会话内只降不升防震荡）：
-     * 呈现 fps 低于目标 93% 或帧间隔标准差超过目标间隔一半，连续 2 个评估窗判不稳 → 降档。
+     * v0.5 判据改口径——以「拉帧 p95 间隔」为主：拉帧样本足够且 p95 ≤ 档位间隔×1.25、均值 ≤ 间隔×1.05
+     * 视为「拉帧跟得上」，此时呈现 fps 略低于目标多半是 pacing 相位损耗，不再据此误降档
+     * （Z fc 实测教训：QVGA 拉帧往返均值 33–35ms≈29fps，旧口径只看呈现 fps 把 30 档误锁到 24）。
+     * 仍判不稳的三种情况：①呈现间隔抖动 σ 超间隔 0.6（真抖，宁降档不抖）；②拉帧跟不上且呈现 fps<目标 93%；
+     * ③拉帧跟得上但呈现 fps 跌破目标 80%（解码/呈现侧真出问题）。连续 2 窗不稳 → 降档：
      * 30fps 档时先降帧尺寸（保帧率牺牲分辨率）；尺寸已最低或帧率档已降过，则降帧率档（30→24→20→15）。
      * 返回新的 unstableStreak。
      */
-    private int evaluateStability(double fps, List<Float> ivs, int streak) {
+    private int evaluateStability(double fps, List<Float> ivs, int streak,
+                                  long pullP95Ms, double pullMeanMs, int pullSamples) {
         int target = targetFps();
         double interval = 1000.0 / target;
         double mean = 0;
@@ -551,12 +660,28 @@ public class RemoteController {
         double var = 0;
         for (float v : ivs) var += (v - mean) * (v - mean);
         double std = ivs.isEmpty() ? 0 : Math.sqrt(var / ivs.size());
-        boolean unstable = fps < target * 0.93 || std > interval * 0.5;
-        if (!unstable) return 0;
+        boolean pullKnown = pullP95Ms >= 0 && pullSamples >= 8;
+        boolean pullKeepsUp = pullKnown && pullP95Ms <= interval * 1.25 && pullMeanMs <= interval * 1.05;
+        boolean jittery = std > interval * 0.6;
+        boolean unstable;
+        if (jittery) unstable = true;
+        else if (pullKnown && !pullKeepsUp) unstable = fps < target * 0.93;
+        else if (pullKeepsUp) unstable = fps < target * 0.80;
+        else unstable = fps < target * 0.93 || std > interval * 0.5; // 拉帧样本不足 → 回退旧口径
+        if (!unstable) {
+            if (pullKeepsUp && fps < target * 0.93) {
+                Diag.op("LIVEVIEW", "稳定性评估：呈现 " + String.format("%.1f", fps) + "fps/目标 " + target
+                        + "，但拉帧跟得上（往返均值 " + String.format("%.1f", pullMeanMs) + "ms p95 " + pullP95Ms
+                        + "ms ≤ 档位间隔 " + String.format("%.1f", interval) + "ms×1.25），按拉帧口径保持当前档不降");
+            }
+            return 0;
+        }
         streak++;
         Diag.op("LIVEVIEW", "稳定性评估：呈现 " + String.format("%.1f", fps) + "fps/目标 " + target
-                + "，间隔均值 " + String.format("%.1f", mean) + "ms 标准差 " + String.format("%.1f", std)
-                + "ms → 不稳观察 " + streak + "/2");
+                + "，呈现间隔均值 " + String.format("%.1f", mean) + "ms 标准差 " + String.format("%.1f", std)
+                + "ms，拉帧往返均值 " + String.format("%.1f", pullMeanMs) + "ms p95 "
+                + (pullP95Ms >= 0 ? pullP95Ms + "ms" : "样本不足") + "（" + (pullKeepsUp ? "拉帧跟得上" : "拉帧跟不上")
+                + "）→ 不稳观察 " + streak + "/2");
         if (streak < 2) return streak;
         if (target == FPS_TIERS[0] && lvSizeSupported && lvSizeIdx > 0) {
             final int newIdx = lvSizeIdx - 1;
@@ -705,7 +830,8 @@ public class RemoteController {
                     maybeAutoTransfer(handle, oi);
                     byte[] thumb = client.getThumb(handle);
                     Bitmap bmp = thumb != null && thumb.length > 0
-                            ? BitmapFactory.decodeByteArray(thumb, 0, thumb.length) : null;
+                            ? ThumbCache.orientByExif(BitmapFactory.decodeByteArray(thumb, 0, thumb.length), thumb)
+                            : null; // v0.5：与网格缩略图同一口径按 EXIF 方向转正（仅显示位图）
                     Diag.op("REMOTE", "拍完即览：新对象 0x" + Integer.toHexString(handle) + " "
                             + oi.filename + " 缩略图 " + (bmp != null ? bmp.getWidth() + "x" + bmp.getHeight() : "无"));
                     ui.onNewPhoto(handle, bmp, oi.filename);

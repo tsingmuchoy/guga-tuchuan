@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- v0.5 应用内在线更新：拉起系统安装器装下载好的新版 APK 用 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 低版本（API<=28）经 MediaStore/传统路径写相册用；29+ 走 RELATIVE_PATH 不需要 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
@@ -48,5 +50,12 @@
             android:name=".IntervalService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- v0.5 在线更新：把 cacheDir/qm-update 里的新版 APK 以 content:// 递给系统安装器（框架-only 自研，替代 AndroidX FileProvider） -->
+        <provider
+            android:name=".UpdateFileProvider"
+            android:authorities="com.qingmu.tuchuan.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

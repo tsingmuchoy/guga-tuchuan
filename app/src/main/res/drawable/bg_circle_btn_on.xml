@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 圆形浮层按钮（开态）：尼康黄实心（图标在 Java 侧配黑，v0.5） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#FFDE00" />
+</shape>

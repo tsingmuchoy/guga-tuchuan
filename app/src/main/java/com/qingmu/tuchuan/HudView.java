@@ -24,7 +24,11 @@ public class HudView extends View {
     private float[][] hist; // [3][64] 0..1
     private int frameW, frameH;
     private float afNx = -1, afNy = -1; // 归一化坐标，<0 表示不显示
-    private boolean afOk = true;
+    // v0.5 对焦框三态（仿手机相机）：黄=对焦中、黄→绿=合焦、红=未合焦；判定来源是相机 AfDrive 响应码
+    public static final int AF_FOCUSING = 0;
+    public static final int AF_OK = 1;
+    public static final int AF_FAIL = 2;
+    private int afState = AF_FOCUSING;
     private long afAtMs = 0;
 
     public HudView(Context c) {
@@ -45,8 +49,9 @@ public class HudView extends View {
     public void setHistogram(float[][] bins) { hist = bins; invalidate(); }
     public void setFrameSize(int w, int h) { frameW = w; frameH = h; invalidate(); }
 
-    public void showAf(float nx, float ny, boolean ok) {
-        afNx = nx; afNy = ny; afOk = ok; afAtMs = System.currentTimeMillis();
+    /** 显示/更新对焦框：点按瞬间先 AF_FOCUSING（黄），相机响应回来再以同坐标改判 AF_OK（绿）/ AF_FAIL（红） */
+    public void showAfState(float nx, float ny, int state) {
+        afNx = nx; afNy = ny; afState = state; afAtMs = System.currentTimeMillis();
         invalidate();
         postDelayed(() -> { afNx = -1; invalidate(); }, 2500); // 框显示 2.5s 后自动收起
     }
@@ -89,7 +94,7 @@ public class HudView extends View {
             float cx = r.left + afNx * r.width();
             float cy = r.top + afNy * r.height();
             float half = r.width() * 0.08f;
-            afPaint.setColor(afOk ? Ui.ACCENT : Ui.ERR);
+            afPaint.setColor(afState == AF_OK ? Ui.OK : afState == AF_FAIL ? Ui.ERR : Ui.ACCENT);
             canvas.drawRect(cx - half, cy - half * 0.75f, cx + half, cy + half * 0.75f, afPaint);
         }
     }
