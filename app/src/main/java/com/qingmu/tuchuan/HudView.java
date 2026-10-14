@@ -23,6 +23,10 @@ public class HudView extends View {
     private boolean histOn = true;
     private float[][] hist; // [3][64] 0..1
     private int frameW, frameH;
+    // v0.5.1 数字放大（纯显示层）：displayRect() 在 FIT_CENTER 基础矩形上再施加
+    // 「绕画面中心缩放 zoomScale + 平移 (zoomTx, zoomTy)」；lvImage 用同样的 scale/translation
+    // （其 pivot 同为画面中心）渲染，两边共用这一套口径，点按对焦经 mapToFrame 逆映射回帧坐标。
+    private float zoomScale = 1f, zoomTx = 0f, zoomTy = 0f;
     private float afNx = -1, afNy = -1; // 归一化坐标，<0 表示不显示
     // v0.5 对焦框三态（仿手机相机）：黄=对焦中、黄→绿=合焦、红=未合焦；判定来源是相机 AfDrive 响应码
     public static final int AF_FOCUSING = 0;
@@ -56,14 +60,59 @@ public class HudView extends View {
         postDelayed(() -> { afNx = -1; invalidate(); }, 2500); // 框显示 2.5s 后自动收起
     }
 
-    /** 图像在当前 View 内的实际显示矩形（FIT_CENTER）；帧尺寸未知时为整个 View */
-    public RectF displayRect() {
+    /** FIT_CENTER 基础矩形（未施加数字放大变换）；帧尺寸未知时为整个 View */
+    public RectF baseRect() {
         float vw = getWidth(), vh = getHeight();
         if (frameW <= 0 || frameH <= 0 || vw <= 0 || vh <= 0) return new RectF(0, 0, vw, vh);
         float scale = Math.min(vw / frameW, vh / frameH);
         float w = frameW * scale, h = frameH * scale;
         float l = (vw - w) / 2f, t = (vh - h) / 2f;
         return new RectF(l, t, l + w, t + h);
+    }
+
+    /** 图像实际显示矩形 = 基础矩形施加数字放大变换（绕基础矩形中心缩放 + 平移）；绘制与点按换算共用 */
+    public RectF displayRect() {
+        RectF b = baseRect();
+        if (zoomScale == 1f && zoomTx == 0f && zoomTy == 0f) return b;
+        float cx = b.centerX(), cy = b.centerY();
+        float w = b.width() * zoomScale, h = b.height() * zoomScale;
+        float l = cx + zoomTx - w / 2f, t = cy + zoomTy - h / 2f;
+        return new RectF(l, t, l + w, t + h);
+    }
+
+    public float getZoomScale() { return zoomScale; }
+    public float getZoomTx() { return zoomTx; }
+    public float getZoomTy() { return zoomTy; }
+
+    /** 设置数字放大变换并钳制平移（放大后的画面不许被拖到完全脱离视野：中心偏移不超过画面尺寸一半 + 半屏） */
+    public void setZoom(float scale, float tx, float ty) {
+        zoomScale = Math.max(1f, Math.min(4f, scale));
+        if (zoomScale == 1f) { tx = 0f; ty = 0f; }
+        RectF b = baseRect();
+        float maxTx = b.width() * zoomScale / 2f + getWidth() / 4f;
+        float maxTy = b.height() * zoomScale / 2f + getHeight() / 4f;
+        zoomTx = Math.max(-maxTx, Math.min(maxTx, tx));
+        zoomTy = Math.max(-maxTy, Math.min(maxTy, ty));
+        invalidate();
+    }
+
+    public void resetZoom() { zoomScale = 1f; zoomTx = 0f; zoomTy = 0f; invalidate(); }
+
+    /**
+     * 屏幕点 → 帧归一化坐标（点按对焦唯一映射口径，1x 与放大状态共用）：
+     * 先验点在显示矩形内，再逆变换回基础矩形求归一化；点在画面外（黑边/拖出区）返回 null。
+     */
+    public float[] mapToFrame(float px, float py) {
+        RectF d = displayRect();
+        if (d.width() <= 0 || px < d.left || px > d.right || py < d.top || py > d.bottom) return null;
+        RectF b = baseRect();
+        // 逆变换：p_base_centered = (p_disp - center - T) / scale
+        float ux = b.centerX() + (px - b.centerX() - zoomTx) / zoomScale;
+        float uy = b.centerY() + (py - b.centerY() - zoomTy) / zoomScale;
+        float nx = (ux - b.left) / b.width();
+        float ny = (uy - b.top) / b.height();
+        if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+        return new float[]{nx, ny};
     }
 
     @Override protected void onDraw(Canvas canvas) {

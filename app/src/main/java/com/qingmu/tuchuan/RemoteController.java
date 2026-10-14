@@ -39,6 +39,10 @@ public class RemoteController {
         /** 全量属性面板数据（v0.5：相机自报全部属性 + 剩余张数文案 + 电量百分比，电量读不到为 -1） */
         void onProps(List<PropItem> items, String remainText, int battery);
         void onPropUpdated(PropItem item, boolean ok, String msg);
+        /** v0.5.1 增量刷新：事件/轮询/机身变挡引起的属性变化（已同步进中枢缓存），UI 据此更新浮层速览与打开中的面板行 */
+        void onPropsChanged(List<PropItem> changed);
+        /** v0.5.1：剩余张数/电量单独刷新（拍完后走事件路径，不再触发全量重读） */
+        void onRemainChanged(String remainText, int battery);
         void onFrame(Bitmap bmp, float fps);
         void onHistogram(float[][] bins); // [3][64]，0..1 归一化
         void onStatus(String msg);
@@ -119,6 +123,34 @@ public class RemoteController {
     /** 相机 DeviceInfo 自报支持的属性码全集（连接装配时由上层注入；为空则参数面板回退到 CamProps 目录试探） */
     private volatile List<Integer> supportedPropCodes = new ArrayList<>();
 
+    // ---- v0.5.1 属性缓存与增量刷新（事件/轮询/写入共用一条路径，禁止两套刷新逻辑） ----
+    /** 最近一次全量读取的属性行缓存：事件与轮询只更新其中个别行，UI 增量回调也以此为准 */
+    private volatile List<PropItem> cachedItems = new ArrayList<>();
+    private volatile String cachedRemain = null;
+    private volatile int cachedBattery = -1;
+    /** 属性码 → 最近一次收到 0x4006 事件的时间（轮询据此判断「变了但没事件」并留诊断证据） */
+    private final ConcurrentHashMap<Integer, Long> lastEventAt = new ConcurrentHashMap<>();
+    /** 属性码 → 最近一次增量刷新执行时间 + 待合并标记（同属性 300ms 内多次事件只刷一次） */
+    private final ConcurrentHashMap<Integer, Long> lastRefreshAt = new ConcurrentHashMap<>();
+    private final Set<Integer> refreshPending = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ScheduledExecutorService debounce =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "qingmu-prop-debounce"); t.setDaemon(true); return t;
+            });
+    /** AF/拍摄命令在飞标记（UI 线程置位、exec 任务结束清零）：轮询见到任一为真就跳过本轮，不与命令抢通道 */
+    private volatile boolean afBusy = false;
+    private volatile boolean captureBusy = false;
+    /** 点按对焦最新点位（连点只保留最新一个；归一化坐标 + 换算所用显示矩形说明，执行时再换算像素） */
+    private final java.util.concurrent.atomic.AtomicReference<float[]> pendingAfPoint =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> pendingAfRect =
+            new java.util.concurrent.atomic.AtomicReference<>("");
+    private final Object afLock = new Object();
+    private volatile boolean afRunning = false;
+    /** 点按对焦前自动切单点区域（0x501C=0x8010）的开关，由参数面板复选框经 setAutoSinglePoint 注入 */
+    private volatile boolean autoSinglePoint = true;
+    private volatile boolean clockWarnLogged = false;
+
     // ---- v0.3 拍完自动回传（事件驱动） ----
     /**
      * 自动回传候选回调（在 exec 线程调用，只许做入队这类非阻塞动作）：
@@ -146,6 +178,34 @@ public class RemoteController {
     /** 注入相机自报的属性码全集（DeviceInfo.devicePropertiesSupported），参数面板据此全量枚举 */
     public void setSupportedPropCodes(List<Integer> codes) {
         supportedPropCodes = codes != null ? new ArrayList<>(codes) : new ArrayList<>();
+    }
+
+    /** v0.5.1：轮询门控——AF 或拍摄命令在飞时为 true，UI 层据此跳过本轮轮询 */
+    public boolean isCommandBusy() { return afBusy || captureBusy || afRunning; }
+
+    /** v0.5.1：参数面板复选框——点按对焦前是否自动把对焦区域切到单点（仅 0x501C 可靠识别时生效） */
+    public void setAutoSinglePoint(boolean on) { autoSinglePoint = on; }
+
+    /** 缓存中按码查属性行（UI 增量渲染/AF 区域判定用）；无则 null */
+    public PropItem cachedProp(int code) {
+        for (PropItem it : cachedItems) if (it.def.code == code) return it;
+        return null;
+    }
+
+    /** 把一行属性并入缓存（有则原位替换 desc，无则新建行追加），返回缓存中的行 */
+    private PropItem upsertCache(CamProps.Def def, PtpIpClient.DevicePropDesc desc) {
+        synchronized (cachedItems) {
+            for (PropItem it : cachedItems) {
+                if (it.def.code == def.code) { it.desc = desc; return it; }
+            }
+            PropItem it = new PropItem();
+            it.def = def;
+            it.desc = desc;
+            List<PropItem> copy = new ArrayList<>(cachedItems);
+            copy.add(it);
+            cachedItems = copy;
+            return it;
+        }
     }
 
     public RemoteController(PtpIpClient client, CameraProfile profile, boolean experimental, Ui ui) {
@@ -215,6 +275,9 @@ public class RemoteController {
             if (authoritative) codes.addAll(supportedPropCodes);
             else codes.addAll(CamProps.catalogCodes());
             for (CamProps.Def d : CamProps.DEFS) codes.add(d.code); // 经典 8 项保底（相机列表偶有遗漏时仍给出置灰行）
+            // v0.5.1：尼康 DeviceInfo 的属性清单历来不全——0x501C（对焦区域模式）不在清单里，
+            // 但相机 AF 后会发它的 0x4006 事件，故无条件加入试探集（读不到按权威清单外条目处理，不留假行）
+            codes.add(PtpIpClient.PROP_FOCUS_METERING);
             codes.remove(PtpIpClient.PROP_NIKON_LIVE_VIEW_IMAGE_SIZE);
             java.util.Map<Integer, PtpIpClient.DevicePropDesc> fetched = new java.util.HashMap<>();
             int skipped = 0;
@@ -263,7 +326,72 @@ public class RemoteController {
             }
             int battery = client.getBatteryLevel(); // 失败返回 -1 不抛（client 内部已吞异常）
             lastPropRefreshMs = System.currentTimeMillis();
+            cachedItems = items;
+            cachedRemain = remain;
+            if (battery >= 0) cachedBattery = battery;
+            checkCameraClock(items);
             ui.onProps(items, remain, battery);
+        });
+    }
+
+    /**
+     * v0.5.1 相机时钟体检：0x5011 年份早于手机当前年份（典型：相机从未设过时钟、停在出厂 2021 年）→
+     * 诊断记一行（每会话一次）+ 面板在该行下给同步提示。这里只报告、绝不自动写——同步必须用户在面板点按。
+     */
+    private void checkCameraClock(List<PropItem> items) {
+        if (clockWarnLogged) return;
+        for (PropItem it : items) {
+            if (it.def.code != PtpIpClient.PROP_DATETIME || !it.available()
+                    || it.desc.curVal == null || it.desc.curVal.str == null) continue;
+            int camYear = parseClockYear(it.desc.curVal.str);
+            int phoneYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
+            if (camYear > 0 && camYear < phoneYear) {
+                clockWarnLogged = true;
+                Diag.op("REMOTE", "相机时钟疑似未设置：相机时间 " + it.desc.curVal.str + "（" + camYear
+                        + " 年，早于手机 " + phoneYear + " 年），拍出的照片 EXIF 时间会全错；"
+                        + "可在参数面板「其他」组点『同步手机时间』一键对齐（不会自动写）");
+            }
+        }
+    }
+
+    /** 解析 PTP DateTime 串（yyyyMMdd'T'HHmmss）的年份；解析不了返回 -1 */
+    static int parseClockYear(String s) {
+        if (s == null || s.length() < 4) return -1;
+        try { return Integer.parseInt(s.substring(0, 4)); } catch (Exception e) { return -1; }
+    }
+
+    /**
+     * v0.5.1 同步相机时钟（用户在参数面板点按触发）：把手机当前时间按 PTP 格式写 0x5011，
+     * 写后回读验证并记诊断；结果经 onPropUpdated 回 UI（行刷新 + 状态行文案）。不自动调用。
+     */
+    public void syncCameraClock() {
+        exec.execute(() -> {
+            PropItem item = cachedProp(PtpIpClient.PROP_DATETIME);
+            String now = new java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
+                    .format(new java.util.Date());
+            PtpIpClient.PropValue v = new PtpIpClient.PropValue(PtpIpClient.DTC_STR);
+            v.str = now;
+            int rc = client.setDevicePropValue(PtpIpClient.PROP_DATETIME, v);
+            if (item == null) {
+                item = upsertCache(CamProps.defOf(PtpIpClient.PROP_DATETIME), null);
+            }
+            if (rc != PtpIpClient.RC_OK) {
+                Diag.op("REMOTE", "相机时钟同步失败：Set 0x5011=" + now + " rc=0x" + Integer.toHexString(rc));
+                ui.onPropUpdated(item, false, "同步失败，相机返回 0x" + Integer.toHexString(rc));
+                return;
+            }
+            try {
+                item.desc = client.getDevicePropDesc(PtpIpClient.PROP_DATETIME);
+                String back = item.desc.curVal != null ? item.desc.curVal.str : null;
+                boolean match = now.equals(back);
+                Diag.op("REMOTE", "相机时钟同步：写入 " + now + "，回读 " + back
+                        + (match ? "（一致 ✓）" : "（不一致，以相机回读为准）"));
+                clockWarnLogged = match; // 同步成功后不再重复警告
+                ui.onPropUpdated(item, true, match ? "相机时钟已同步为 " + now : "已写入，相机回读为 " + back);
+            } catch (Exception e) {
+                Diag.op("REMOTE", "相机时钟同步：已写入 " + now + "，回读失败：" + e.getMessage());
+                ui.onPropUpdated(item, true, "已写入（回读失败：" + e.getMessage() + "）");
+            }
         });
     }
 
@@ -294,6 +422,7 @@ public class RemoteController {
             // 回读确认：以相机实际值为准刷新面板
             try {
                 item.desc = client.getDevicePropDesc(item.def.code);
+                upsertCache(item.def, item.desc); // v0.5.1：写入结果同步进缓存，事件/轮询比对以此为准
                 boolean match = item.desc.curVal != null
                         && (item.desc.curVal.datatype == PtpIpClient.DTC_STR
                             ? String.valueOf(chosen.str).equals(String.valueOf(item.desc.curVal.str))
@@ -497,12 +626,16 @@ public class RemoteController {
             busyStreak = 0; noJpegStreak = 0; notLvStreak = 0;
             if (!headerLogged) {
                 headerLogged = true;
+                // v0.5.1：帧头字段（含是否有相机 AF 回执框）未经 libgphoto2 核实——其实现只在数据里
+                // 扫描 JPEG SOI、不解析尼康帧头——故不猜字段，只把完整帧头 hex 整份打进诊断（16B/行，
+                // 每 LV 会话一份），供后续拿真机数据离线比对分析。
                 StringBuilder hex = new StringBuilder();
-                int hn = Math.min(32, f.jpegOff);
-                for (int i = 0; i < hn; i++) hex.append(String.format("%02x", f.data[i] & 0xFF));
-                Diag.op("LIVEVIEW", "首帧：总长 " + f.data.length + "B，帧头 " + f.jpegOff + "B"
-                        + (hn > 0 ? "，帧头前 " + hn + "B=" + hex : "")
-                        + "（AF 框字段偏移待真机按此帧头解析，本版先只显示画面）");
+                for (int i = 0; i < f.jpegOff && i < f.data.length; i++) {
+                    if (i % 16 == 0) hex.append(String.format("\n  +%03d: ", i));
+                    hex.append(String.format("%02x ", f.data[i] & 0xFF));
+                }
+                Diag.op("LIVEVIEW", "首帧：总长 " + f.data.length + "B，帧头 " + f.jpegOff
+                        + "B，完整帧头 hex（每 LV 会话一份，供 AF 框字段离线分析）：" + hex);
             }
             RawFrame rf = new RawFrame();
             rf.data = f.data; rf.jpegOff = f.jpegOff; rf.jpegLen = f.jpegLen;
@@ -745,47 +878,169 @@ public class RemoteController {
     // ---------- 点按对焦 / 快门 / 录像 ----------
 
     /**
-     * 点按对焦：入参为归一化坐标（0..1，相对当前帧画面，已由 UI 层扣除 FIT_CENTER 黑边）。
-     * 换算到 LV 图像像素坐标（N-Link v3.1.0 实证：AF 坐标域=LV 图像像素空间、按帧宽高线性映射）
-     * → ChangeAfArea(0x9205) → AfDrive(0x90C1)；结果以相机响应码为准（0xA002=未合焦）。
+     * 点按对焦（v0.5.1 串行化重写）：入参为归一化坐标（0..1，相对当前帧画面，UI 层已按实际显示矩形换算）
+     * + 换算所用显示矩形说明（进诊断备查）。
+     * v0.5.0 的问题（Z fc 日志实证）：用户连点时上一次 AF 未完，ChangeAfArea 回 DeviceBusy(0x2019)，
+     * 旧代码不看 rc1 继续发 AfDrive → 在旧区域对焦、表现为「对焦不准」。
+     * 现在：连点只保留最新点位排队串行执行；ChangeAfArea 回 0x2019 → 等 DeviceReady 后用最新点位重试一次；
+     * 区域设置最终失败则**不发** AfDrive 并经 onAfResult(false) 把对焦框置红。
      */
-    public void tapFocus(final float nx, final float ny) {
+    public void tapFocus(final float nx, final float ny, final String rectDesc) {
         if (!lvOn) { ui.onStatus("先开启取景再点按对焦"); return; }
         if (!featureAllowed(F_FOCUS)) { ui.onStatus("点按对焦在当前机型未验证/已降级"); return; }
         if (lastFrameW <= 0 || lastFrameH <= 0) { ui.onStatus("尚无取景帧"); return; }
-        final int x = Math.max(0, Math.min(lastFrameW - 1, Math.round(nx * (lastFrameW - 1))));
-        final int y = Math.max(0, Math.min(lastFrameH - 1, Math.round(ny * (lastFrameH - 1))));
-        exec.execute(() -> {
-            Diag.op("REMOTE", "点按对焦：归一化(" + nx + "," + ny + ") → 像素(" + x + "," + y + ") @帧 " + lastFrameW + "x" + lastFrameH);
-            int rc1 = client.nikonChangeAfArea(x, y);
-            if (rc1 == PtpIpClient.RC_NIKON_NOT_LIVE_VIEW) {
-                ui.onAfResult(false, "相机不在取景状态（0xA00B）");
+        pendingAfPoint.set(new float[]{nx, ny});
+        if (rectDesc != null) pendingAfRect.set(rectDesc);
+        synchronized (afLock) {
+            if (afRunning) {
+                Diag.op("REMOTE", "点按对焦连点合并：AF 进行中，只保留最新点位 (" + nx + "," + ny + ") 排队");
                 return;
             }
-            int rc2 = client.nikonAfDrive();
-            if (rc2 == PtpIpClient.RC_OK) {
-                noteSuccess(F_FOCUS);
-                ui.onAfResult(true, "对焦完成");
-            } else if (rc2 == PtpIpClient.RC_NIKON_OUT_OF_FOCUS) {
-                ui.onAfResult(false, "未合焦（相机回 0xA002）");
-            } else {
-                noteFailure(F_FOCUS, "AfDrive rc=0x" + Integer.toHexString(rc2));
-                ui.onAfResult(false, "对焦失败：区域设置 rc=0x" + Integer.toHexString(rc1)
-                        + "，AF 驱动 rc=0x" + Integer.toHexString(rc2));
+            afRunning = true;
+            afBusy = true;
+        }
+        exec.execute(this::runAfLoop);
+    }
+
+    /** AF 串行主循环：把排队中的最新点位逐个执行完；退出前复查防竞态丢点 */
+    private void runAfLoop() {
+        while (true) {
+            float[] p;
+            while ((p = pendingAfPoint.getAndSet(null)) != null) {
+                doAfOnce(p[0], p[1], pendingAfRect.get());
             }
-        });
+            synchronized (afLock) {
+                if (pendingAfPoint.get() != null) continue; // 复查期间又来了新点，继续跑
+                afRunning = false;
+                afBusy = false;
+                return;
+            }
+        }
+    }
+
+    private int afPxX(float nx) { return Math.max(0, Math.min(lastFrameW - 1, Math.round(nx * (lastFrameW - 1)))); }
+    private int afPxY(float ny) { return Math.max(0, Math.min(lastFrameH - 1, Math.round(ny * (lastFrameH - 1)))); }
+
+    /** 执行一次完整 AF：[自动切单点] → ChangeAfArea（Busy 重试一次）→ AfDrive → 回读 0x501C 记诊断 */
+    private void doAfOnce(float nx, float ny, String rectDesc) {
+        int x = afPxX(nx), y = afPxY(ny);
+        Diag.op("REMOTE", "点按对焦：归一化(" + nx + "," + ny + ") → 像素(" + x + "," + y + ") @帧 "
+                + lastFrameW + "x" + lastFrameH + "｜换算所用显示矩形 " + rectDesc);
+        maybeAutoSinglePoint();
+        int rc1 = client.nikonChangeAfArea(x, y);
+        if (rc1 == PtpIpClient.RC_DEVICE_BUSY) {
+            Diag.op("REMOTE", "ChangeAfArea 回 DeviceBusy(0x2019)（上一次相机操作未完），"
+                    + "等 DeviceReady 后用最新点位重试一次");
+            int wrc = client.nikonWaitBusy(3000);
+            Diag.op("REMOTE", "DeviceReady 轮询结果 rc=0x" + Integer.toHexString(wrc));
+            float[] np = pendingAfPoint.getAndSet(null);
+            float ux = nx, uy = ny;
+            if (np != null) {
+                ux = np[0]; uy = np[1];
+                Diag.op("REMOTE", "忙等待期间收到新点按，重试改用最新点位 (" + ux + "," + uy + ")");
+            }
+            x = afPxX(ux); y = afPxY(uy);
+            rc1 = client.nikonChangeAfArea(x, y);
+            Diag.op("REMOTE", "ChangeAfArea 重试：像素(" + x + "," + y + ") rc=0x" + Integer.toHexString(rc1));
+        }
+        if (rc1 == PtpIpClient.RC_NIKON_NOT_LIVE_VIEW) {
+            ui.onAfResult(false, "相机不在取景状态（0xA00B）");
+            return;
+        }
+        if (rc1 != PtpIpClient.RC_OK) {
+            // v0.5.1：区域都没设成功就绝不发 AfDrive（旧版照发 → 在旧区域对焦，是「对不准」的实锤路径之一）
+            noteFailure(F_FOCUS, "ChangeAfArea rc=0x" + Integer.toHexString(rc1));
+            ui.onAfResult(false, "对焦区域设置失败 rc=0x" + Integer.toHexString(rc1) + "，未驱动对焦");
+            return;
+        }
+        int rc2 = client.nikonAfDrive();
+        readFocusMeteringAfterAf();
+        if (rc2 == PtpIpClient.RC_OK) {
+            noteSuccess(F_FOCUS);
+            ui.onAfResult(true, "对焦完成");
+        } else if (rc2 == PtpIpClient.RC_NIKON_OUT_OF_FOCUS) {
+            ui.onAfResult(false, "未合焦（相机回 0xA002）");
+        } else {
+            noteFailure(F_FOCUS, "AfDrive rc=0x" + Integer.toHexString(rc2));
+            ui.onAfResult(false, "对焦失败：AF 驱动 rc=0x" + Integer.toHexString(rc2));
+        }
+    }
+
+    /**
+     * 点按对焦前自动切单点（仅当能可靠识别时）：对焦区域属性是 0x501C（FocusMeteringMode，
+     * libgphoto2 ptp.h:1968 核实；尼康 Z 取值 0x8010=单点 AF，config.c Z 表核实）。
+     * 条件全齐才动手：缓存里该属性可读、可写、当前值有名可辨且非单点类、枚举里确有 0x8010。
+     * 任一不满足就不自动改——当前模式可辨时在状态行提示它可能修正对焦点，不可辨时只记诊断。
+     * （注：0x500C 经核实是闪光模式，与 AF 区域无关，绝不拿它做此事。）
+     */
+    private void maybeAutoSinglePoint() {
+        PropItem fm = cachedProp(PtpIpClient.PROP_FOCUS_METERING);
+        if (fm == null || !fm.available() || fm.desc == null || fm.desc.curVal == null) {
+            if (fm == null) Diag.op("REMOTE", "对焦区域模式（0x501C）未读到，跳过自动切单点（不猜）");
+            return;
+        }
+        long cur = fm.desc.curVal.num;
+        if (CamProps.isSinglePointClass(cur)) return;
+        String curName = CamProps.focusMeteringName(cur);
+        if (!autoSinglePoint) return;
+        boolean hasSingle = false;
+        for (PtpIpClient.PropValue pv : fm.desc.enumValues) if (pv.num == 0x8010) hasSingle = true;
+        if (curName == null || !fm.desc.writable() || !hasSingle) {
+            if (curName != null) {
+                Diag.op("REMOTE", "当前对焦区域=" + curName + "，无法自动切单点（可写="
+                        + fm.desc.writable() + "，枚举含单点=" + hasSingle + "），相机可能自行修正对焦点");
+                ui.onStatus("当前对焦区域为「" + curName + "」，相机可能自行修正对焦点（可在参数面板切到单点 AF）");
+            }
+            return;
+        }
+        int rc = client.setDevicePropValue(PtpIpClient.PROP_FOCUS_METERING,
+                new PtpIpClient.PropValue(fm.desc.datatype, 0x8010));
+        if (rc == PtpIpClient.RC_OK) {
+            try { fm.desc = client.getDevicePropDesc(PtpIpClient.PROP_FOCUS_METERING); } catch (Exception ignore) {}
+            upsertCache(fm.def, fm.desc);
+            Diag.op("REMOTE", "点按对焦前自动切换对焦区域：" + curName + " → 单点 AF（0x501C=0x8010）");
+            List<PropItem> ch = new ArrayList<>();
+            ch.add(fm);
+            ui.onPropsChanged(ch);
+            ui.onStatus("已切换为单点对焦（原：" + curName + "）");
+        } else {
+            Diag.op("REMOTE", "自动切单点失败 rc=0x" + Integer.toHexString(rc) + "，按当前区域模式（" + curName + "）继续对焦");
+        }
+    }
+
+    /**
+     * AfDrive 后回读一次 0x501C 记诊断：AfDrive 的 rc=0x2001 只表示「受理」，不是合焦证明；
+     * 合焦与否目前只能以响应码（0xA002=未合焦）与后续 0x501C 变化事件旁证，本读值供核对区域模式未被相机改动。
+     * （尼康 LV 帧头里若含相机 AF 回执框，其字段偏移未经 libgphoto2 核实——gphoto 只扫 JPEG SOI 不解析帧头——不猜、不画。）
+     */
+    private void readFocusMeteringAfterAf() {
+        PropItem fm = cachedProp(PtpIpClient.PROP_FOCUS_METERING);
+        int dt = fm != null && fm.desc != null ? fm.desc.datatype : PtpIpClient.DTC_UINT16;
+        try {
+            PtpIpClient.PropValue v = client.getDevicePropValueTyped(PtpIpClient.PROP_FOCUS_METERING, dt);
+            String nm = CamProps.focusMeteringName(v.num);
+            Diag.op("REMOTE", "AfDrive 后回读 0x501C（对焦区域模式）=" + v
+                    + (nm != null ? "（" + nm + "）" : "（名称未核实，只记原值）"));
+        } catch (Exception e) {
+            Diag.op("REMOTE", "AfDrive 后回读 0x501C 失败：" + e.getMessage());
+        }
     }
 
     public void capture() {
         if (!featureAllowed(F_CAPTURE)) { ui.onStatus("遥控快门已降级禁用"); return; }
+        captureBusy = true; // v0.5.1：轮询据此跳过本轮，不与拍摄命令抢通道
         exec.execute(() -> {
-            int rc = client.nikonCapture();
-            if (rc == PtpIpClient.RC_OK) {
-                noteSuccess(F_CAPTURE);
-                ui.onStatus("已发出拍摄指令，等待相机写入存储卡…");
-            } else {
-                noteFailure(F_CAPTURE, "capture rc=0x" + Integer.toHexString(rc));
-                ui.onStatus("拍摄失败 rc=0x" + Integer.toHexString(rc) + "（详见诊断）");
+            try {
+                int rc = client.nikonCapture();
+                if (rc == PtpIpClient.RC_OK) {
+                    noteSuccess(F_CAPTURE);
+                    ui.onStatus("已发出拍摄指令，等待相机写入存储卡…");
+                } else {
+                    noteFailure(F_CAPTURE, "capture rc=0x" + Integer.toHexString(rc));
+                    ui.onStatus("拍摄失败 rc=0x" + Integer.toHexString(rc) + "（详见诊断）");
+                }
+            } finally {
+                captureBusy = false;
             }
         });
     }
@@ -818,6 +1073,135 @@ public class RemoteController {
         });
     }
 
+    // ---------- v0.5.1 增量刷新引擎（事件 / 轮询 / 写入共用一条路径） ----------
+
+    /** 曝光组里可写性随模式挡位翻转的属性：模式（0x500E）变化时除读新值外还要补读它们的 Desc */
+    private static final int[] MODE_LINKED_PROPS = {
+            PtpIpClient.PROP_F_NUMBER, PtpIpClient.PROP_EXPOSURE_TIME,
+            PtpIpClient.PROP_EXPOSURE_INDEX, PtpIpClient.PROP_EXPOSURE_BIAS};
+    /** 轮询兜底的速览四值（只读值不读 Desc） */
+    private static final int[] QUICK_PROPS = {
+            PtpIpClient.PROP_EXPOSURE_PROGRAM, PtpIpClient.PROP_F_NUMBER,
+            PtpIpClient.PROP_EXPOSURE_TIME, PtpIpClient.PROP_EXPOSURE_INDEX};
+    /** 待刷新属性集（事件风暴合并）：300ms 窗口内的多次事件只合成一次刷新 */
+    private final Set<Integer> dirtyProps = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean flushScheduled =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** 0x4006 事件入口：记事件时间 + 标脏合并调度（不再全量重读——见 flushDirtyProps） */
+    private void onPropChangedEvent(int code) {
+        lastEventAt.put(code, System.currentTimeMillis());
+        dirtyProps.add(code);
+        if (flushScheduled.compareAndSet(false, true)) {
+            try {
+                debounce.schedule(this::flushDirtyProps, 300, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                flushScheduled.set(false);
+                flushDirtyProps();
+            }
+        }
+    }
+
+    private void flushDirtyProps() {
+        flushScheduled.set(false);
+        if (dirtyProps.isEmpty()) return;
+        List<Integer> codes = new ArrayList<>(dirtyProps);
+        dirtyProps.clear();
+        exec.execute(() -> { for (int c : codes) refreshOneProp(c, false); });
+    }
+
+    /**
+     * 单属性增量刷新：只重读这一个属性的 Desc（值+可写性+取值集，约一次事务），
+     * 并入缓存后经 onPropsChanged 直达 UI 的浮层速览与打开中的面板行。
+     * code=0x500E（模式换挡）时额外补读曝光组关联属性 Desc——转盘换挡会让光圈/快门可写性翻转。
+     */
+    private void refreshOneProp(int code, boolean fromPoll) {
+        long t0 = System.currentTimeMillis();
+        CamProps.Def def = CamProps.defOf(code);
+        PropItem before = cachedProp(code);
+        String oldText = before != null && before.available() ? before.currentText() : null;
+        PtpIpClient.DevicePropDesc desc;
+        try {
+            desc = client.getDevicePropDesc(code);
+        } catch (Exception e) {
+            Diag.op("EVENT", "属性 0x" + Integer.toHexString(code) + "（" + def.name + "）增量重读失败："
+                    + e.getMessage());
+            return;
+        }
+        PropItem item = upsertCache(def, desc);
+        List<PropItem> changed = new ArrayList<>();
+        changed.add(item);
+        String extra = "";
+        if (code == PtpIpClient.PROP_EXPOSURE_PROGRAM) {
+            int n = 0;
+            for (int linked : MODE_LINKED_PROPS) {
+                try {
+                    changed.add(upsertCache(CamProps.defOf(linked), client.getDevicePropDesc(linked)));
+                    n++;
+                } catch (Exception ignore) { /* 关联属性读不到就不带，目标属性本身已刷新 */ }
+            }
+            extra = "，并补读曝光组 " + n + " 个关联属性 Desc（模式换挡的可写性翻转）";
+        }
+        lastRefreshAt.put(code, t0);
+        Diag.op("EVENT", "属性变化处理：0x" + Integer.toHexString(code) + "（" + def.name + "）"
+                + (oldText != null ? oldText + " → " : "") + item.currentText() + extra
+                + "，耗时 " + (System.currentTimeMillis() - t0) + "ms" + (fromPoll ? "（轮询触发）" : ""));
+        ui.onPropsChanged(changed);
+    }
+
+    /**
+     * v0.5.1 轮询兜底（UI 层约 2s 调一次，本方法只在遥控页前台时被调用）：
+     * 只 GetDevicePropValue 读速览四值与缓存比对；值变了就走与事件相同的 refreshOneProp 路径，
+     * 若该属性近 2.6s 内没收到过 0x4006 事件，记一行 [EVENT] 轮询发现变化——为判断
+     * 「机身转盘变挡到底发不发事件」留证据。AF/拍摄在飞时整轮跳过，不与命令抢通道。
+     */
+    public void pollQuickProps() {
+        if (isCommandBusy() || !client.isConnected()) return;
+        exec.execute(() -> {
+            if (isCommandBusy()) return;
+            for (int code : QUICK_PROPS) {
+                PropItem cached = cachedProp(code);
+                if (cached == null || !cached.available() || cached.desc == null
+                        || cached.desc.curVal == null || cached.desc.datatype == PtpIpClient.DTC_STR) continue;
+                PtpIpClient.PropValue v;
+                try {
+                    v = client.getDevicePropValueTyped(code, cached.desc.datatype);
+                } catch (Exception e) {
+                    continue; // 读不到就跳过该项，下轮再试，不刷屏
+                }
+                if (v.num == cached.desc.curVal.num) continue;
+                String oldText = cached.currentText();
+                Long evAt = lastEventAt.get(code);
+                boolean eventSeen = evAt != null && System.currentTimeMillis() - evAt < 2600;
+                if (!eventSeen) {
+                    Diag.op("EVENT", "轮询发现变化：0x" + Integer.toHexString(code) + "（"
+                            + CamProps.defOf(code).name + "）" + oldText + " → "
+                            + CamProps.format(code, v) + "（未收到对应 0x4006 事件）");
+                }
+                refreshOneProp(code, true);
+            }
+        });
+    }
+
+    /** 拍完（CaptureComplete）后刷剩余张数/电量：存储信息只在此与连接、列表加载时读，不进普通事件路径 */
+    private void refreshRemainAfterCapture() {
+        if (storageId == 0) return;
+        final int sid = storageId;
+        exec.execute(() -> {
+            try {
+                PtpIpClient.StorageInfo si = client.getStorageInfo(sid);
+                if (si.freeImages > 0) {
+                    cachedRemain = "约 " + si.freeImages + " 张（来源：存储信息，相机估算）";
+                }
+                int b = client.getBatteryLevel();
+                if (b >= 0) cachedBattery = b;
+                ui.onRemainChanged(cachedRemain, cachedBattery);
+            } catch (Exception e) {
+                Diag.op("EVENT", "拍完刷新剩余张数失败：" + e.getMessage());
+            }
+        });
+    }
+
     // ---------- 事件 → 拍完即览 ----------
 
     private void onPtpEvent(int code, int[] params) {
@@ -841,12 +1225,12 @@ public class RemoteController {
             });
         } else if (code == PtpIpClient.EC_CAPTURE_COMPLETE) {
             ui.onStatus("拍摄完成，照片已写入存储卡");
+            refreshRemainAfterCapture(); // v0.5.1：存储信息刷新只留在拍完这一刻，不进普通属性事件路径
         } else if (code == PtpIpClient.EC_DEVICE_PROP_CHANGED) {
-            // 相机端参数变化 → 非取景时节流刷新状态面板（>3s 才刷；取景中不抢通道影响帧率）
-            if (!lvOn && storageId != 0
-                    && System.currentTimeMillis() - lastPropRefreshMs > 3000) {
-                loadProps(storageId);
-            }
+            // v0.5.1 重写（原实现：每次事件全量重读 21 个属性 Desc + GetStorageInfo，约 0.7s 事务，
+            // P 挡快门随光线抖动时形成事件风暴，与拉帧抢同一命令通道、把帧率拖垮）：
+            // 现在只标脏合并（300ms 窗口）， flush 时按属性逐个单读；GetStorageInfo 已移出此路径。
+            if (params != null && params.length >= 1) onPropChangedEvent(params[0]);
         }
     }
 
@@ -880,6 +1264,7 @@ public class RemoteController {
             recording = false;
         }
         client.setEventListener(null);
+        debounce.shutdownNow();
         exec.shutdownNow();
         Diag.op("REMOTE", "遥控中枢已关闭");
     }

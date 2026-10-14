@@ -26,8 +26,10 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.InputType;
+import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
@@ -163,6 +165,23 @@ public class MainActivity extends Activity {
     private View shutterInner;
     private HudView hud;
     private TextView rcStatusTv, rcTopTitleTv, rcTopSubTv, rcTopParamsTv, rcLvStateTv;
+    // v0.5.1 真全屏：App 框架三件（标题行/连接胶囊/页签栏）与根布局的引用，进遥控页时整体隐藏
+    private View chromeTitle, chromeTabs;
+    private LinearLayout rootLayout;
+    private int currentPage = 0;
+    private View rcBackBtn;
+    private int lvFrameW = 0, lvFrameH = 0; // 帧尺寸变化检测（变了就重置数字放大）
+    // v0.5.1 速览轮询兜底：遥控页前台 + 已连接 + 无命令在飞时约 2s 一轮（中枢内再自检一次）
+    private final Handler pollHandler = new Handler(Looper.getMainLooper());
+    private final Runnable pollTick = new Runnable() {
+        @Override public void run() {
+            if (currentPage == 2 && remote != null && AppState.get().sessionReady()
+                    && !remote.isCommandBusy()) {
+                remote.pollQuickProps();
+            }
+            pollHandler.postDelayed(this, 2000);
+        }
+    };
     private TextView lvNoteTv, lvHintTv, ovTitleTv, rcRecTv, rcBigNameTv, rcPanelSummaryTv;
     private LinearLayout ovList, rcPanelBox;
     private View rcPanel, captureBtn, movieBtn;
@@ -218,8 +237,9 @@ public class MainActivity extends Activity {
         DownloadRecord.init(this);
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
+        pollHandler.postDelayed(pollTick, 2000); // v0.5.1 速览轮询兜底（Runnable 内自带页面/连接/忙碌门控）
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
-        Diag.log("清木图传 v0.5.0 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/69 张照片列表；下载/拍摄/录像/间隔拍摄与在线更新待复测；其余机型标准协议兼容待验证）");
+        Diag.log("清木图传 v0.5.1 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/69 张照片列表；下载/拍摄/录像/间隔拍摄与在线更新待复测；其余机型标准协议兼容待验证）");
         // v0.5 在线更新：启动自动检查一次（延迟避开首帧；静默口径——失败只记 [UPDATE] 诊断不打扰）
         new Handler(Looper.getMainLooper()).postDelayed(() -> checkUpdate(false), 1500);
         DownloadService.listener = new DownloadService.Listener() {
@@ -278,6 +298,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        pollHandler.removeCallbacks(pollTick);
         teardownRemote();
         Diag.setListener(null);
         DownloadService.listener = null;
@@ -351,6 +372,7 @@ public class MainActivity extends Activity {
 
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
+        rootLayout = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Ui.BG);
         // v0.5：根布局不再统一留边——照片页网格/遥控页取景要全幅铺满；标题/页签/各页内容各自补内边距
@@ -358,6 +380,7 @@ public class MainActivity extends Activity {
 
         // 标题行：黄相机图标 + 大字标题
         LinearLayout titleRow = new LinearLayout(this);
+        chromeTitle = titleRow; // v0.5.1：遥控全屏时整行隐藏
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
         titleRow.setPadding(dp(14), 0, dp(14), 0);
         ImageView titleIcon = new ImageView(this);
@@ -368,7 +391,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.5.0", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.5.1", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -395,6 +418,7 @@ public class MainActivity extends Activity {
 
         // 页签
         LinearLayout tabs = new LinearLayout(this);
+        chromeTabs = tabs; // v0.5.1：遥控全屏时整行隐藏
         tabs.setPadding(dp(14), 0, dp(14), 0);
         int[] tabIcons = {R.drawable.ic_wifi, R.drawable.ic_badge_image, R.drawable.ic_remote, R.drawable.ic_diag};
         String[] tabNames = {"连接", "照片", "遥控", "诊断"};
@@ -429,6 +453,8 @@ public class MainActivity extends Activity {
     }
 
     private void showPage(int idx) {
+        currentPage = idx;
+        setRemoteFullscreen(idx == 2); // v0.5.1：遥控页 = 真全屏沉浸取景，进页藏尽 App 框架与系统栏
         for (int i = 0; i < 4; i++) {
             pages[i].setVisibility(i == idx ? View.VISIBLE : View.GONE);
             tabBtns[i].setTextColor(i == idx ? Ui.ACCENT : Ui.TEXT_DIM);
@@ -449,6 +475,39 @@ public class MainActivity extends Activity {
         }
         if (idx == 0) refreshRecentWorks();
         if (idx == 1) updatePhotosEmptyState();
+    }
+
+    /**
+     * v0.5.1 真全屏：隐藏标题行/连接胶囊/页签栏 + 根顶部留白，并用系统 UI 标志进沉浸式
+     * （状态栏/导航栏一并藏起，用户从边缘滑动可临时呼出属系统行为）；退出时全部恢复。
+     * 遥控页「‹ 返回」与系统返回键都走 showPage(0)，与既有切页 teardown（停取景）同一条路。
+     */
+    private void setRemoteFullscreen(boolean fs) {
+        if (chromeTitle != null) chromeTitle.setVisibility(fs ? View.GONE : View.VISIBLE);
+        if (capsule != null) capsule.setVisibility(fs ? View.GONE : View.VISIBLE);
+        if (chromeTabs != null) chromeTabs.setVisibility(fs ? View.GONE : View.VISIBLE);
+        if (rootLayout != null) rootLayout.setPadding(0, fs ? 0 : dp(12), 0, 0);
+        View decor = getWindow().getDecorView();
+        if (fs) {
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+        } else {
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        }
+    }
+
+    @Override public void onBackPressed() {
+        if (currentPage == 2) { showPage(0); return; } // 全屏取景中按返回 = 退出全屏回连接页
+        super.onBackPressed();
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && currentPage == 2) setRemoteFullscreen(true); // 从安装器/系统栏呼出回来后重进沉浸
     }
 
     // ---------- 连接页 ----------
@@ -1720,6 +1779,55 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * v0.5.1 点按对焦入口（手势层确认是单击后调用）：坐标经 HudView.mapToFrame 逆映射
+     * （与绘制共用 displayRect 口径，含数字放大变换），点在显示画面外直接忽略；
+     * 把实际所用显示矩形一并传给中枢写进 [REMOTE] 诊断，备查坐标口径。
+     */
+    private void handleLvTapFocus(float px, float py) {
+        if (remote == null || !remote.isLiveViewOn()) return;
+        float[] n = hud.mapToFrame(px, py);
+        if (n == null) {
+            rcStatusTv.setText("点在画面外（黑边），已忽略");
+            return;
+        }
+        pendingAfNx = n[0]; pendingAfNy = n[1];
+        hud.showAfState(n[0], n[1], HudView.AF_FOCUSING); // 黄=对焦中，相机 AfDrive 响应回来再改判绿/红
+        RectF d = hud.displayRect();
+        String rectDesc = "left=" + (int) d.left + " top=" + (int) d.top
+                + " w=" + (int) d.width() + " h=" + (int) d.height()
+                + "（数字放大 ×" + String.format(Locale.US, "%.2f", hud.getZoomScale()) + "）";
+        remote.tapFocus(n[0], n[1], rectDesc);
+    }
+
+    /** v0.5.1 数字放大：把变换同步给 HudView（钳制在此）与 lvImage（同 scale/translation、pivot 同为画面中心） */
+    private void applyLvZoom(float scale, float tx, float ty) {
+        hud.setZoom(scale, tx, ty);
+        lvImage.setScaleX(hud.getZoomScale());
+        lvImage.setScaleY(hud.getZoomScale());
+        lvImage.setTranslationX(hud.getZoomTx());
+        lvImage.setTranslationY(hud.getZoomTy());
+    }
+
+    /** 以某个屏幕点为锚放大/缩小：锚点下的帧内容保持不动（捏合与双击共用） */
+    private void applyLvZoomAt(float newScale, float fx, float fy) {
+        RectF b = hud.baseRect();
+        float cx = b.centerX(), cy = b.centerY();
+        float s0 = hud.getZoomScale();
+        float ux = (fx - cx - hud.getZoomTx()) / s0;
+        float uy = (fy - cy - hud.getZoomTy()) / s0;
+        float ns = Math.max(1f, Math.min(4f, newScale));
+        applyLvZoom(ns, fx - cx - ux * ns, fy - cy - uy * ns);
+    }
+
+    private void resetLvZoom() {
+        if (hud != null) hud.resetZoom();
+        if (lvImage != null) {
+            lvImage.setScaleX(1f); lvImage.setScaleY(1f);
+            lvImage.setTranslationX(0f); lvImage.setTranslationY(0f);
+        }
+    }
+
     /** 参数面板开/关：底部上滑半屏（不压暗取景），打开时按最新 propItems 重渲染一次 */
     private void setPanelOpen(boolean open) {
         rcPanelOpen = open;
@@ -1780,40 +1888,77 @@ public class MainActivity extends Activity {
         hud = new HudView(this);
         lvStage.addView(hud, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        lvHintTv = txt("取景未开启\n点右侧开关开启取景；取景中点画面任意位置即点按对焦", 13, Ui.TEXT_DIM, false);
+        lvHintTv = txt("取景未开启\n点右侧开关开启取景；取景中点画面任意位置即点按对焦，双击画面可放大查看（捏合/拖动同样可用）", 13, Ui.TEXT_DIM, false);
         lvHintTv.setGravity(Gravity.CENTER);
         lvStage.addView(lvHintTv, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        lvStage.setOnTouchListener((v, ev) -> {
-            if (ev.getAction() != MotionEvent.ACTION_UP) return true;
-            if (remote == null || !remote.isLiveViewOn()) return true;
-            RectF r = hud.displayRect();
-            float px = ev.getX(), py = ev.getY();
-            if (r.width() <= 0 || px < r.left || px > r.right || py < r.top || py > r.bottom) {
-                rcStatusTv.setText("点在画面外（黑边），已忽略");
+        // v0.5.1 手势层：点按对焦（onSingleTapConfirmed，自带双击消歧等待）/ 双击 1x↔2.5x /
+        // 双指捏合 1–4x / 放大后单指拖动平移。坐标换算只走 HudView.mapToFrame 一条口径
+        // （含放大变换逆映射），与 1x 共用，禁止另算一套。
+        final GestureDetector lvGestures = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+            @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                handleLvTapFocus(e.getX(), e.getY());
                 return true;
             }
-            float nx = (px - r.left) / r.width();
-            float ny = (py - r.top) / r.height();
-            pendingAfNx = nx; pendingAfNy = ny;
-            hud.showAfState(nx, ny, HudView.AF_FOCUSING); // 黄=对焦中，相机 AfDrive 响应回来再改判绿/红
-            remote.tapFocus(nx, ny);
+            @Override public boolean onDoubleTap(MotionEvent e) {
+                if (hud.getZoomScale() > 1.05f) {
+                    applyLvZoom(1f, 0f, 0f);
+                    rcStatusTv.setText("已恢复 1× 显示");
+                } else {
+                    applyLvZoomAt(2.5f, e.getX(), e.getY());
+                    rcStatusTv.setText("已放大 2.5× 查看（双击恢复，单指拖动平移，点按仍可对焦）");
+                }
+                return true;
+            }
+            @Override public boolean onScroll(MotionEvent e1, MotionEvent e2, float dx, float dy) {
+                if (hud.getZoomScale() > 1f && e2.getPointerCount() == 1) {
+                    applyLvZoom(hud.getZoomScale(), hud.getZoomTx() - dx, hud.getZoomTy() - dy);
+                    return true;
+                }
+                return false;
+            }
+        });
+        final ScaleGestureDetector lvScale = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override public boolean onScale(ScaleGestureDetector d) {
+                applyLvZoomAt(hud.getZoomScale() * d.getScaleFactor(), d.getFocusX(), d.getFocusY());
+                return true;
+            }
+        });
+        lvStage.setOnTouchListener((v, ev) -> {
+            lvScale.onTouchEvent(ev);
+            lvGestures.onTouchEvent(ev);
             return true;
         });
 
-        // —— 顶部浮层：连接/型号 + REC 计时；电量/剩余 + 模式·光圈·快门·ISO 速览 + 取景档位 ——
+        // —— 顶部浮层（v0.5.1 紧凑单行）：左=‹返回 + 型号·电量·剩余；右=模式·光圈·快门·ISO·AF区域 速览 + 尺寸档·fps + REC ——
         LinearLayout topBar = new LinearLayout(this);
-        topBar.setOrientation(LinearLayout.VERTICAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setBackgroundColor(0xB3000000);
-        topBar.setPadding(dp(14), dp(8), dp(14), dp(8));
+        topBar.setPadding(dp(8), dp(6), dp(10), dp(6));
         topBar.setClickable(true); // 吞掉落在浮层上的点按，防穿透到舞台触发对焦
         FrameLayout.LayoutParams tblp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP);
         pageRoot.addView(topBar, tblp);
-        LinearLayout topRow1 = new LinearLayout(this);
-        topRow1.setGravity(Gravity.CENTER_VERTICAL);
-        rcTopTitleTv = txt("未连接相机", 13, Ui.TEXT, true);
-        topRow1.addView(rcTopTitleTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView backTv = txt("‹ 返回", 13, Ui.TEXT, true);
+        backTv.setBackground(getDrawable(R.drawable.bg_chip));
+        backTv.setPadding(dp(10), dp(5), dp(10), dp(5));
+        backTv.setClickable(true);
+        backTv.setOnClickListener(v -> showPage(0)); // 退出全屏：恢复框架/系统栏 + 既有切页 teardown 停取景
+        rcBackBtn = backTv;
+        topBar.addView(backTv);
+        rcTopSubTv = txt("电量 — · 剩余可拍 —", 11, Ui.TEXT_DIM, false);
+        LinearLayout.LayoutParams tslp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        tslp.setMargins(dp(8), 0, dp(6), 0);
+        topBar.addView(rcTopSubTv, tslp);
+        rcTopParamsTv = txt("参数 —", 11, Ui.TEXT, true);
+        rcTopParamsTv.setGravity(Gravity.END);
+        topBar.addView(rcTopParamsTv);
+        rcLvStateTv = txt("取景未开启", 11, Ui.ACCENT, false);
+        rcLvStateTv.setGravity(Gravity.END);
+        LinearLayout.LayoutParams lslp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lslp.setMargins(dp(6), 0, 0, 0);
+        topBar.addView(rcLvStateTv, lslp);
         rcRecTv = txt("REC 00:00", 12, Ui.ERR, true);
         Drawable recDot = icon(R.drawable.ic_rec, Ui.ERR);
         int rds = dp(11);
@@ -1821,27 +1966,10 @@ public class MainActivity extends Activity {
         rcRecTv.setCompoundDrawables(recDot, null, null, null);
         rcRecTv.setCompoundDrawablePadding(dp(5));
         rcRecTv.setVisibility(View.GONE);
-        topRow1.addView(rcRecTv);
-        topBar.addView(topRow1);
-        LinearLayout topRow2 = new LinearLayout(this);
-        topRow2.setGravity(Gravity.CENTER_VERTICAL);
-        rcTopSubTv = txt("电量 — · 剩余可拍 —", 11, Ui.TEXT_DIM, false);
-        LinearLayout.LayoutParams tslp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
-        tslp.setMargins(0, dp(2), 0, 0);
-        topRow2.addView(rcTopSubTv, tslp);
-        LinearLayout topRight = new LinearLayout(this);
-        topRight.setOrientation(LinearLayout.VERTICAL);
-        rcTopParamsTv = txt("参数 —", 12, Ui.TEXT, true);
-        rcTopParamsTv.setGravity(Gravity.END);
-        topRight.addView(rcTopParamsTv);
-        rcLvStateTv = txt("取景未开启", 11, Ui.ACCENT, false);
-        rcLvStateTv.setGravity(Gravity.END);
-        topRight.addView(rcLvStateTv);
-        LinearLayout.LayoutParams trlp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams rrlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        trlp.setMargins(dp(10), dp(2), 0, 0);
-        topRow2.addView(topRight, trlp);
-        topBar.addView(topRow2);
+        rrlp.setMargins(dp(8), 0, 0, 0);
+        topBar.addView(rcRecTv, rrlp);
 
         // —— 右侧竖排浮层开关：取景电源/网格/直方图/监看滤镜/帧尺寸档/参数面板 ——
         LinearLayout rail = new LinearLayout(this);
@@ -2160,15 +2288,22 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    /** 顶部浮层速览与面板顶部状态行：连接/型号、电量/剩余、模式·光圈·快门·ISO（只拼相机真报到的项，缺项省略不编造） */
+    /** 剩余张数文案的紧凑版（浮层单行用）：截掉括号里的来源说明，面板顶部仍用全文 */
+    private static String shortRemain(String s) {
+        if (s == null) return "—";
+        int p = s.indexOf('（');
+        return p > 0 ? s.substring(0, p) : s;
+    }
+
+    /** 顶部浮层速览与面板顶部状态行：型号·电量·剩余（紧凑行）、模式·光圈·快门·ISO·AF区域（只拼相机真报到的项，缺项省略不编造） */
     private void updateTopSummary() {
-        if (rcTopTitleTv == null) return;
+        if (rcTopSubTv == null) return;
         boolean conn = AppState.get().client != null && AppState.get().client.isConnected();
         String model = AppState.get().deviceInfo != null ? AppState.get().deviceInfo.model : "";
-        rcTopTitleTv.setText(conn ? "已连接" + (model.isEmpty() ? "" : " · " + model) : "未连接相机");
-        String sub = "电量 " + (rcBattery >= 0 ? rcBattery + "%" : "—") + " · 剩余可拍 " + rcRemainText;
-        rcTopSubTv.setText(sub);
-        if (rcPanelSummaryTv != null) rcPanelSummaryTv.setText(sub);
+        String subFull = "电量 " + (rcBattery >= 0 ? rcBattery + "%" : "—") + " · 剩余可拍 " + rcRemainText;
+        rcTopSubTv.setText((conn ? (model.isEmpty() ? "已连接" : model) + " · " : "")
+                + "电量 " + (rcBattery >= 0 ? rcBattery + "%" : "—") + " · 剩余 " + shortRemain(rcRemainText));
+        if (rcPanelSummaryTv != null) rcPanelSummaryTv.setText(subFull);
         StringBuilder sb = new StringBuilder();
         RemoteController.PropItem mode = findProp(PtpIpClient.PROP_EXPOSURE_PROGRAM);
         if (mode != null && mode.available() && mode.desc.curVal != null) {
@@ -2182,6 +2317,12 @@ public class MainActivity extends Activity {
                 && iso.desc.curVal.datatype != PtpIpClient.DTC_STR) {
             if (sb.length() > 0) sb.append(" · ");
             sb.append("ISO ").append(iso.desc.curVal.num);
+        }
+        // v0.5.1：对焦区域模式进速览（机身或面板一改，这里立刻能看到，配合事件/轮询增量刷新）
+        RemoteController.PropItem fm = findProp(PtpIpClient.PROP_FOCUS_METERING);
+        if (fm != null && fm.available() && fm.desc.curVal != null) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("AF区域 ").append(fm.currentText());
         }
         rcTopParamsTv.setText(sb.length() > 0 ? sb.toString() : "参数 —");
     }
@@ -2295,7 +2436,16 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
                 rlp.setMargins(dp(8), 0, 0, 0);
-                if (avail && it.canWrite()) {
+                if (it.def.code == PtpIpClient.PROP_DATETIME && avail) {
+                    // v0.5.1 相机时钟：STR 无取值集走不了「调整」弹层，给专用「同步手机时间」按钮
+                    // （写手机当前时间 + 回读验证在中枢，中枢绝不自动写、只此按钮触发）
+                    Button sync = smallGhostBtn("同步手机时间");
+                    sync.setOnClickListener(v -> {
+                        if (remote != null) remote.syncCameraClock();
+                        else Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show();
+                    });
+                    row.addView(sync, rlp);
+                } else if (avail && it.canWrite()) {
                     if (writeAllowed) {
                         Button adj = smallGhostBtn("调整");
                         adj.setOnClickListener(v -> showPropPicker(it));
@@ -2313,9 +2463,43 @@ public class MainActivity extends Activity {
                     row.addView(txt(why, 11, Ui.TEXT_DIM, false), rlp);
                 }
                 rcPanelBox.addView(row, wrapMargin(5));
+                if (it.def.code == PtpIpClient.PROP_DATETIME && avail && it.desc.curVal != null
+                        && it.desc.curVal.str != null) {
+                    int camYear = RemoteController.parseClockYear(it.desc.curVal.str);
+                    int phoneYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
+                    if (camYear > 0 && camYear < phoneYear) {
+                        rcPanelBox.addView(txt("⚠ 相机时钟停在 " + camYear + " 年（手机为 " + phoneYear
+                                + " 年），照片的 EXIF 拍摄时间会全错。点上方『同步手机时间』即可一键对齐，不会自动修改。", 11, Ui.ACCENT, false), wrapMargin(3));
+                    }
+                }
             }
             if (g == CamProps.GROUP_EXPOSURE) addAutoDecideNote();
+            if (g == CamProps.GROUP_FOCUS) addAfAreaRow();
         }
+    }
+
+    /**
+     * v0.5.1 对焦组附加行：当前对焦区域模式 + 「点按对焦自动切单点」开关。
+     * 自动切单点只在中枢能可靠识别 0x501C（FocusMeteringMode，0x8010=单点）时才真正发生，
+     * 这里只负责开关与现状展示；识别不了时中枢只提示不乱改。
+     */
+    private void addAfAreaRow() {
+        RemoteController.PropItem fm = findProp(PtpIpClient.PROP_FOCUS_METERING);
+        String cur = fm != null && fm.available() ? fm.currentText() : "未读到（相机未报告 0x501C）";
+        rcPanelBox.addView(txt("当前对焦区域：" + cur + "。区域模式非单点时，相机可能自行修正点按对焦点。", 11, Ui.TEXT_DIM, false), wrapMargin(4));
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        CheckBox cb = new CheckBox(this);
+        cb.setChecked(prefs.getBoolean("af_auto_single", true));
+        cb.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        cb.setOnCheckedChangeListener((bv, checked) -> {
+            prefs.edit().putBoolean("af_auto_single", checked).apply();
+            if (remote != null) remote.setAutoSinglePoint(checked);
+        });
+        row.addView(cb);
+        row.addView(txt("点按对焦前自动切换为单点 AF（仅当相机区域模式可可靠识别时）", 12, Ui.TEXT, false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        rcPanelBox.addView(row, wrapMargin(2));
     }
 
     /**
@@ -2386,6 +2570,10 @@ public class MainActivity extends Activity {
         @Override public void onFrame(Bitmap bmp, float fps) {
             if (pages[2].getVisibility() != View.VISIBLE) return; // 不在遥控页不做 UI 工作
             runOnUiThread(() -> {
+                if (bmp.getWidth() != lvFrameW || bmp.getHeight() != lvFrameH) {
+                    lvFrameW = bmp.getWidth(); lvFrameH = bmp.getHeight();
+                    resetLvZoom(); // 帧尺寸/比例变了（如切了尺寸档），旧放大变换不再对位，重置回 1×
+                }
                 lvImage.setImageBitmap(bmp);
                 hud.setFrameSize(bmp.getWidth(), bmp.getHeight());
                 if (lvHintTv.getVisibility() == View.VISIBLE) lvHintTv.setVisibility(View.GONE);
@@ -2420,9 +2608,32 @@ public class MainActivity extends Activity {
         @Override public void onLiveView(boolean on, String msg) {
             runOnUiThread(() -> {
                 setRailOn(railLvBtn, on);
+                if (!on) resetLvZoom();
                 lvHintTv.setVisibility(on ? View.GONE : View.VISIBLE);
                 if (!on) rcLvStateTv.setText("取景未开启");
                 rcStatusTv.setText(msg);
+            });
+        }
+        @Override public void onPropsChanged(List<RemoteController.PropItem> changed) {
+            // v0.5.1 增量刷新直达可见面：并入本地属性表 → 顶部浮层速览即时更新；面板开着则整表重绘
+            // （行值与可写置灰状态随之翻转，如机身换挡后光圈/快门从置灰变可调）
+            runOnUiThread(() -> {
+                for (RemoteController.PropItem c : changed) {
+                    boolean found = false;
+                    for (int i = 0; i < propItems.size(); i++) {
+                        if (propItems.get(i).def.code == c.def.code) { propItems.set(i, c); found = true; break; }
+                    }
+                    if (!found) propItems.add(c);
+                }
+                updateTopSummary();
+                if (rcPanelOpen) renderPropsPanel();
+            });
+        }
+        @Override public void onRemainChanged(String remainText, int battery) {
+            runOnUiThread(() -> {
+                if (remainText != null) rcRemainText = remainText;
+                if (battery >= 0) rcBattery = battery;
+                updateTopSummary();
             });
         }
         @Override public void onFeatureStateChanged() {
@@ -2806,6 +3017,7 @@ public class MainActivity extends Activity {
             try {
                 teardownRemote();
                 remote = new RemoteController(client, profile, prefs.getBoolean("remote_exp", false), remoteUi);
+                remote.setAutoSinglePoint(prefs.getBoolean("af_auto_single", true)); // v0.5.1：面板复选框的持久化值
                 remote.setStorageId(st.storageId);
                 remote.setSupportedPropCodes(di.devicePropertiesSupported); // v0.5：相机自报属性全集 → 参数面板全量枚举
                 remote.queryLvSize();

@@ -85,6 +85,8 @@ public class PtpIpClient {
     public static final int PROP_EXPOSURE_INDEX   = 0x500F; // ISO
     public static final int PROP_EXPOSURE_BIAS    = 0x5010; // 曝光补偿 INT16 千分之一 EV
     public static final int PROP_STILL_CAPTURE_MODE = 0x5013; // 单拍/连拍（libgphoto2 ptp.h:1959 核实，非剩余张数）
+    public static final int PROP_DATETIME = 0x5011; // 相机日期时间（STR，PTP 格式 yyyyMMdd'T'HHmmss）
+    public static final int PROP_FOCUS_METERING = 0x501C; // 对焦区域/测光模式 FocusMeteringMode（libgphoto2 ptp.h:1968 核实；尼康 Z 取值 0x8010=单点 AF 等，见 CamProps.focusMeteringName）
     public static final int PROP_NIKON_LIVE_VIEW_STATUS = 0xD1A2; // UINT8，1=LiveView 中
     public static final int PROP_NIKON_LIVE_VIEW_IMAGE_SIZE = 0xD1AC; // UINT8 枚举 1=QVGA/2=VGA/3=XGA（libgphoto2 ptp.h:2643 + config.c nikon_liveviewsize 表核实；相机是否提供以其 desc 自报为准）
 

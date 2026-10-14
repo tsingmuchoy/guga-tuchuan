@@ -54,6 +54,8 @@ public final class CamProps {
         DEFS.add(mode); DEFS.add(fnum); DEFS.add(shut); DEFS.add(iso);
         DEFS.add(bias); DEFS.add(wb); DEFS.add(fm); DEFS.add(drv);
         CATALOG.addAll(DEFS);
+        // 注：0x501C（对焦区域模式）见下方 PTP 标准段；0x500C 是闪光模式（ptp.h:1952 + ptp.c
+        // 尼康值表 32784=Auto），不是 AF 区域，勿混淆。尼康 Z 的 AF 区域正是 0x501C。
         // —— PTP 规范 0x5000 段标准属性（名称为规范 DeviceProp 语义的中文直译） ——
         CATALOG.add(new Def(0x5001, "电池电量", false, GROUP_OTHER));       // BatteryLevel
         CATALOG.add(new Def(0x5002, "功能模式", false, GROUP_OTHER));       // FunctionalMode
@@ -74,7 +76,7 @@ public final class CamProps {
         CATALOG.add(new Def(0x5019, "连拍间隔", false, GROUP_OTHER));       // BurstInterval
         CATALOG.add(new Def(0x501A, "间隔拍摄张数", false, GROUP_OTHER)); // TimelapseNumber
         CATALOG.add(new Def(0x501B, "间隔拍摄间隔", false, GROUP_OTHER)); // TimelapseInterval
-        CATALOG.add(new Def(0x501C, "对焦测光模式", false, GROUP_FOCUS)); // FocusMeteringMode
+        CATALOG.add(new Def(0x501C, "对焦区域模式", true, GROUP_FOCUS)); // FocusMeteringMode（v0.5.1 改名：尼康 Z 的 AF 区域模式即此属性，取值名见 focusMeteringName）
         // 注：尼康取景帧尺寸 0xD1AC 不进本目录——它由遥控页尺寸档开关 + RemoteController 状态机专管，
         // 参数面板若再给一个写入入口会与 lvSizeIdx 状态脱同步；loadProps 枚举时也会显式跳过该码。
     }
@@ -98,15 +100,46 @@ public final class CamProps {
         return r;
     }
 
-    /** 拍摄模式短名（顶栏速览用）：仅 PTP 标准映射 1=M/2=P/3=A/4=S，不确定返回 null（调用方只显示原值，不编造） */
+    /** 拍摄模式短名（顶栏速览用）：PTP 标准映射 1=M/2=P/3=A/4=S + 尼康厂商 32784=AUTO（ptp.c 值表核实），不确定返回 null（调用方只显示原值，不编造） */
     public static String programShort(long n) {
         switch ((int) n) {
             case 1: return "M";
             case 2: return "P";
             case 3: return "A";
             case 4: return "S";
+            case 32784: return "AUTO";
             default: return null;
         }
+    }
+
+    /**
+     * 对焦区域模式（0x501C FocusMeteringMode）尼康取值名。
+     * 出处：libgphoto2 config.c nikon_d850_focus_metering 表（含 Z 机型条目，Z fc 同属 Z 系）
+     * 与 ptp.c 通用表（0x8010=Single Area 两表一致）；表外值返回 null → 调用方显示原值不编造。
+     */
+    public static String focusMeteringName(long n) {
+        switch ((int) n) {
+            case 0x0001: return "中央点";
+            case 0x0002: return "动态区域 AF";
+            case 0x8010: return "单点 AF";
+            case 0x8011: return "自动区域 AF";
+            case 0x8012: return "3D 跟踪";
+            case 0x8013: return "动态区域 AF（72 点）";
+            case 0x8014: return "动态区域 AF（153 点）";
+            case 0x8015: return "群组区域 AF";
+            case 0x8016: return "动态区域 AF（9 点）";
+            case 0x8017: return "精准点 AF";
+            case 0x8018: return "宽区域 AF（小）";
+            case 0x8019: return "宽区域 AF（大）";
+            case 0x801E: return "宽区域 AF（C1）";
+            case 0x801F: return "宽区域 AF（C2）";
+            default: return null;
+        }
+    }
+
+    /** 是否「单点类」区域模式（点按对焦坐标能被相机原样采用）：单点 AF / 精准点 AF（libgphoto2 Z 表核实） */
+    public static boolean isSinglePointClass(long n) {
+        return n == 0x8010 || n == 0x8017;
     }
 
     /** 把相机自报的属性值格式化为显示文本；无法语义化的枚举只给原值 */
@@ -132,13 +165,41 @@ public final class CamProps {
                 return String.format(Locale.US, "%+.1f EV", ev);
             }
             case PtpIpClient.PROP_EXPOSURE_PROGRAM: {
-                // PTP 规范 0x500E 标准值：1 手动 / 2 程序自动 / 3 光圈优先 / 4 快门优先
+                // PTP 规范 0x500E 标准值：1 手动 / 2 程序自动 / 3 光圈优先 / 4 快门优先；
+                // 尼康厂商场景值（libgphoto2 ptp.c 值表）：32784 起为全自动与场景模式
                 switch ((int) n) {
                     case 1: return "M（手动）";
                     case 2: return "P（程序自动）";
                     case 3: return "A（光圈优先）";
                     case 4: return "S（快门优先）";
+                    case 32784: return "AUTO（全自动）";
+                    case 32785: return "人像（相机场景）";
+                    case 32786: return "风景（相机场景）";
+                    case 32787: return "微距（相机场景）";
+                    case 32788: return "运动（相机场景）";
+                    case 32789: return "夜景人像（相机场景）";
+                    case 32790: return "夜景风景（相机场景）";
                     default: return "模式值 " + n + "（相机定义）";
+                }
+            }
+            case PtpIpClient.PROP_FOCUS_METERING: {
+                String nm = focusMeteringName(n);
+                return nm != null ? nm : "区域值 " + n + "（相机定义）";
+            }
+            case 0x500C: {
+                // 闪光模式：PTP 标准小值 + 尼康厂商值（libgphoto2 ptp.c 值表核实）
+                switch ((int) n) {
+                    case 1: return "自动闪光";
+                    case 2: return "闪光关";
+                    case 3: return "填充闪光";
+                    case 4: return "自动防红眼";
+                    case 5: return "防红眼填充";
+                    case 6: return "外接同步";
+                    case 32784: return "自动（尼康）";
+                    case 32785: return "自动慢同步（尼康）";
+                    case 32786: return "后帘慢同步（尼康）";
+                    case 32787: return "防红眼慢同步（尼康）";
+                    default: return "值 " + n + "（相机枚举）";
                 }
             }
             case PtpIpClient.PROP_STILL_CAPTURE_MODE: {
