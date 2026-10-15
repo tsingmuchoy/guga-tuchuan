@@ -35,8 +35,12 @@ public class DownloadService extends Service {
 
     public static class Job {
         public final int handle; public final String filename; public final long size;
-        public Job(int handle, String filename, long size) {
+        /** v0.6.3：size 来自 ObjectInfo 跨会话缓存（未向相机核实）——长度校验与缓存大小冲突时走淘汰+重取 */
+        public final boolean sizeFromCache;
+        public Job(int handle, String filename, long size) { this(handle, filename, size, false); }
+        public Job(int handle, String filename, long size, boolean sizeFromCache) {
             this.handle = handle; this.filename = filename; this.size = size;
+            this.sizeFromCache = sizeFromCache;
         }
     }
 
@@ -166,31 +170,35 @@ public class DownloadService extends Service {
 
         boolean fullRetried = false;
         int ioCycles = 0;
+        final long[] expect = { job.size }; // 期望大小：默认任务值；v0.6.3 缓存冲突重取 Info 后可被修正
+        boolean cacheRefreshed = false;
+        downloadAttempt:
         while (true) {
+          while (true) {
             long offset = part.exists() ? part.length() : 0;
-            if (job.size > 0 && offset > job.size) {
+            if (expect[0] > 0 && offset > expect[0]) {
                 Diag.op("DL", ".part 比目标还大，删除重下：" + job.filename);
                 //noinspection ResultOfMethodCallIgnored
                 part.delete(); offset = 0;
             }
-            if (job.size > 0 && offset == job.size && offset > 0) {
+            if (expect[0] > 0 && offset == expect[0] && offset > 0) {
                 Diag.op("DL", job.filename + " .part 已完整，直接进入发布");
                 break;
             }
-            Diag.op("DL", "开始下载 " + job.filename + " 总 " + PhotoItem.fmtSize(job.size)
+            Diag.op("DL", "开始下载 " + job.filename + " 总 " + PhotoItem.fmtSize(expect[0])
                     + (offset > 0 ? "，从偏移 " + offset + " 续传" : "，整文件"));
             try (FileOutputStream fos = new FileOutputStream(part, offset > 0)) {
                 final long off0 = offset;
                 final long[] lastNotify = {0};
-                client.downloadObject(job.handle, job.size, offset, fos, doneBytes -> {
+                client.downloadObject(job.handle, expect[0], offset, fos, doneBytes -> {
                     // client 回调口径统一为「文件内绝对字节数」（整传从 0 起、续传含已有偏移）
                     Listener l = listener;
                     if (l != null) l.onProgress(job, doneBytes);
                     long now = System.currentTimeMillis();
                     if (now - lastNotify[0] > 400) {
                         lastNotify[0] = now;
-                        int pct = job.size > 0 ? (int) (doneBytes * 100 / job.size) : -1;
-                        notifyProgress(job.filename + "  " + PhotoItem.fmtSize(doneBytes) + "/" + PhotoItem.fmtSize(job.size), pct);
+                        int pct = expect[0] > 0 ? (int) (doneBytes * 100 / expect[0]) : -1;
+                        notifyProgress(job.filename + "  " + PhotoItem.fmtSize(doneBytes) + "/" + PhotoItem.fmtSize(expect[0]), pct);
                     }
                 });
                 break; // 下载成功
@@ -222,9 +230,38 @@ public class DownloadService extends Service {
             }
         }
 
-        long got = part.exists() ? part.length() : 0;
-        if (job.size > 0 && got != job.size) {
-            throw new Exception("长度校验失败：期望 " + job.size + " 实际 " + got);
+            long got = part.exists() ? part.length() : 0;
+            if (expect[0] > 0 && got != expect[0]) {
+                // v0.6.3 缓存错位保护：期望大小来自跨会话缓存且与实收冲突——句柄可能已被复用/缓存错位：
+                // 淘汰该条缓存，向相机重取 Info 一次；相机现报不同就以相机为准写回缓存并整轮重下，
+                // 现报相同/无效则不纠缠，按真实的长度校验失败收场
+                if (job.sizeFromCache && !cacheRefreshed) {
+                    cacheRefreshed = true;
+                    String skey = AppState.get().storageIdentity;
+                    InfoCache.evict(skey, job.handle);
+                    try {
+                        PtpIpClient.ObjectInfo fresh = client.getObjectInfo(job.handle);
+                        if (fresh != null && fresh.size > 0 && fresh.size != expect[0]) {
+                            Diag.op("CACHE", "下载长度与缓存大小不符（缓存 " + expect[0] + " B，相机现报 " + fresh.size
+                                    + " B）：" + job.filename + "——已淘汰缓存并写回现报值，按现报大小重下");
+                            expect[0] = fresh.size;
+                            InfoCache.put(skey, fresh, job.handle);
+                            if (part.exists() && part.length() > expect[0]) {
+                                //noinspection ResultOfMethodCallIgnored
+                                part.delete();
+                            }
+                            continue downloadAttempt;
+                        }
+                        Diag.op("CACHE", "下载长度与缓存大小不符，重取 Info 后相机现报 "
+                                + (fresh != null ? fresh.size : -1) + " B（与缓存一致或无效）："
+                                + job.filename + "——按真实传输失败处理");
+                    } catch (Exception ce) {
+                        Diag.op("CACHE", "缓存冲突后重取 Info 失败：" + ce.getMessage());
+                    }
+                }
+                throw new Exception("长度校验失败：期望 " + expect[0] + " 实际 " + got);
+            }
+            break;
         }
         //noinspection ResultOfMethodCallIgnored
         if (fin.exists()) fin.delete();

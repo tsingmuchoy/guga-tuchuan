@@ -13,6 +13,8 @@ public class PhotoItem {
     public boolean infoFailed = false;
     /** v0.6.1：占位条目的信息读取失败响应码（进提示与诊断） */
     public int infoFailRc = -1;
+    /** v0.6.3：本条信息来自跨会话缓存（未向相机核实）——下载长度与缓存大小冲突时据此走淘汰+重取 */
+    public boolean infoFromCache = false;
 
     public PhotoItem(int handle, PtpIpClient.ObjectInfo info) {
         this.handle = handle; this.info = info;

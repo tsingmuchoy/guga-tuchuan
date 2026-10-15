@@ -183,7 +183,6 @@ public class PtpIpClient {
     private volatile boolean cmdBusy = false;
     private volatile boolean keepAliveInFlight = false;
     private volatile EventListener eventListener;
-    private final Object cmdLock = new Object();
     private int transactionId = 0;
     private long connectionNumber = -1;
     private String cameraName = "";
@@ -200,6 +199,73 @@ public class PtpIpClient {
 
     /** 当前连接是否为 STA（连接至 PC）模式 */
     public boolean isStaSession() { return staSession; }
+
+    // ================= v0.6.3 命令通道优先级门 =================
+    // 优先级（由操作码派生，调用方无感）：用户操作（拍摄/下载/删除/格式化/属性/LiveView 等全部其他操作）
+    // > 缩略图 GetThumb > 信息获取 GetObjectInfo。低优先级事务在通道忙或有更高优先级事务排队时让行；
+    // 同一时刻仍只有一个事务在通道上（与旧 cmdLock 串行语义一致），且同线程可重入
+    // （断线回调在事务线程内触发 teardown 等路径，旧 synchronized 本就可重入，不能改成会自锁）。
+    static final int PRIO_USER = 0, PRIO_THUMB = 1, PRIO_INFO = 2;
+    private final Object cmdGate = new Object();
+    private Thread cmdOwner = null;
+    private int cmdHoldCount = 0;
+    private int cmdOwnerPrio = PRIO_USER;
+    private int gateWaitUser = 0, gateWaitThumb = 0;
+    private volatile long infoYieldCount = 0;
+
+    private static int prioOf(int opCode) {
+        if (opCode == OP_GET_OBJECT_INFO) return PRIO_INFO;
+        if (opCode == OP_GET_THUMB) return PRIO_THUMB;
+        return PRIO_USER;
+    }
+
+    /** 信息获取至今的让行次数（被更高优先级事务插队而等待的 GetObjectInfo 次数），供上层汇总进诊断 */
+    public long getInfoYieldCount() { return infoYieldCount; }
+
+    private void gateAcquire(int prio) throws PtpException {
+        Thread me = Thread.currentThread();
+        synchronized (cmdGate) {
+            if (cmdOwner == me) { cmdHoldCount++; return; } // 同线程重入
+            boolean counted = false;
+            try {
+                while (true) {
+                    boolean higherWaiting = (prio == PRIO_INFO && (gateWaitUser > 0 || gateWaitThumb > 0))
+                            || (prio == PRIO_THUMB && gateWaitUser > 0);
+                    if (cmdOwner == null && !higherWaiting) break;
+                    if (!counted) {
+                        if (prio == PRIO_USER) gateWaitUser++;
+                        else if (prio == PRIO_THUMB) gateWaitThumb++;
+                        counted = true;
+                        // 信息获取因更高优先级在跑/在排而等待 = 一次让行（每事务至多记一次，不刷屏）
+                        if (prio == PRIO_INFO && (gateWaitUser > 0 || gateWaitThumb > 0
+                                || (cmdOwner != null && cmdOwnerPrio < PRIO_INFO))) {
+                            infoYieldCount++;
+                        }
+                    }
+                    try { cmdGate.wait(); }
+                    catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new PtpException("命令通道优先级等待被中断", e);
+                    }
+                }
+            } finally {
+                if (counted) {
+                    if (prio == PRIO_USER) gateWaitUser--;
+                    else if (prio == PRIO_THUMB) gateWaitThumb--;
+                }
+            }
+            cmdOwner = me; cmdHoldCount = 1; cmdOwnerPrio = prio;
+        }
+    }
+
+    private void gateRelease() {
+        synchronized (cmdGate) {
+            if (cmdOwner == Thread.currentThread() && --cmdHoldCount <= 0) {
+                cmdOwner = null; cmdHoldCount = 0;
+                cmdGate.notifyAll();
+            }
+        }
+    }
 
     /** 调节命令通道读超时（socket SO_TIMEOUT 本就是「无字节停顿」超时：每次读到数据即重新计） */
     public synchronized void setCmdSoTimeout(int ms) {
@@ -552,7 +618,8 @@ public class PtpIpClient {
     }
 
     private Result transactInternal(int opCode, int[] params, byte[] dataOut, DataSink sink) throws PtpException {
-        synchronized (cmdLock) {
+        gateAcquire(prioOf(opCode)); // v0.6.3 优先级门替代旧 cmdLock 串行（口径见 gateAcquire 处注释）
+        try {
             if (!connected || cmdOut == null) throw new PtpException("未连接", new IOException("not connected"));
             // 事务 ID 由 transact 统一分配递增（v0.2 审计修复：原实现各调用方手动 ++，异常路径会漏增导致 tid 复用）
             int tid = transactionId++;
@@ -621,6 +688,8 @@ public class PtpIpClient {
                 markDead("命令通道 IO 异常");
                 throw new PtpException("op " + opName + " IO: " + e.getMessage(), e);
             }
+        } finally {
+            gateRelease();
         }
     }
 

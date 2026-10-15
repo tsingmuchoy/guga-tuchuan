@@ -77,6 +77,8 @@ public class MainActivity extends Activity {
     }
 
     private final ExecutorService bg = Executors.newSingleThreadExecutor(guardedThreads("qingmu-bg"));
+    /** v0.6.3：按需识别专用单线程（逐项取 ObjectInfo，经命令通道优先级门让行，不占 bg） */
+    private final ExecutorService infoExec = Executors.newSingleThreadExecutor(guardedThreads("qingmu-info"));
     private SharedPreferences prefs;
     private ThumbCache thumbCache;
 
@@ -254,12 +256,13 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("guga_tuchuan", MODE_PRIVATE);
         thumbCache = new ThumbCache(this);
         DownloadRecord.init(this);
+        InfoCache.init(this); // v0.6.3：ObjectInfo 跨会话缓存（大卡列表按需识别的命中来源）
         AppState.get().wifi = new CameraWifi(this);
         buildUi();
         pollHandler.postDelayed(pollTick, 2000); // v0.5.1 速览轮询兜底（Runnable 内自带页面/连接/忙碌门控）
         Diag.setListener(() -> runOnUiThread(this::refreshDiag));
         CrashLog.dumpPending(this); // v0.6.1：回放上次崩溃堆栈（STA 点按钮退出定性靠它）
-        Diag.log("清木图传 v0.6.2 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/69 张照片列表；v0.6.2 针对 Z 30 外部复测三项：渐进式列表加载/大文件下载断点续传/退出路径审计与掉线取证，均待复测）");
+        Diag.log("清木图传 v0.6.3 启动（Z fc 已于 2026-10-14 真机实测通过：连接/profile/属性 Desc/LiveView 帧率/点按对焦/空闲保活/照片列表；v0.6.3 针对 Z 30 大卡列表性能：诊断定性 5505 个对象逐项识别约 55ms/项即约 7 分钟——本版改可视区按需识别 + 命令通道优先级让行 + ObjectInfo 跨会话缓存，待复测）");
         // v0.5 在线更新：启动自动检查一次（延迟避开首帧；静默口径——失败只记 [UPDATE] 诊断不打扰）
         new Handler(Looper.getMainLooper()).postDelayed(() -> checkUpdate(false), 1500);
         DownloadService.listener = new DownloadService.Listener() {
@@ -424,7 +427,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tlp.setMargins(dp(8), 0, 0, 0);
         titleRow.addView(title, tlp);
-        TextView ver = txt("v0.6.2", 11, Ui.TEXT_DIM, false);
+        TextView ver = txt("v0.6.3", 11, Ui.TEXT_DIM, false);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.setMargins(dp(8), dp(6), 0, 0);
@@ -1230,6 +1233,13 @@ public class MainActivity extends Activity {
                 adapter.notifyDataSetChanged();
             });
             return true;
+        });
+        // v0.6.3：滚动即预取——可视区及前后各一屏的待识别条目入队（识别跟随视线，不再全量回填）
+        grid.setOnScrollListener(new AbsListView.OnScrollListener() {
+            @Override public void onScrollStateChanged(AbsListView view, int scrollState) {}
+            @Override public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
+                enqueueInfoAround(firstVisibleItem, visibleItemCount, totalItemCount);
+            }
         });
         col.addView(grid, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
@@ -3127,6 +3137,9 @@ public class MainActivity extends Activity {
                 st.storageId = sids[0];
                 PtpIpClient.StorageInfo si = client.getStorageInfo(sids[0]);
                 st.storageDesc = (si.description != null && !si.description.isEmpty()) ? si.description : "存储卡";
+                // v0.6.3：ObjectInfo 缓存键（描述+卷标+总容量）——同卡重复连接命中、换卡天然换键
+                st.storageIdentity = st.storageDesc + "|"
+                        + (si.volumeLabel != null ? si.volumeLabel : "") + "|" + si.maxCapacity;
                 final String storageLine = st.storageDesc + " · 剩余 " + PhotoItem.fmtSize(si.freeBytes)
                         + " / " + PhotoItem.fmtSize(si.maxCapacity);
                 runOnUiThread(() -> devStorageTv.setText("存储卡：" + storageLine));
@@ -3171,6 +3184,8 @@ public class MainActivity extends Activity {
     }
 
     private void onDisconnectClicked() {
+        // v0.6.3：断开即作废按需识别队列（工作线程会在代次/连接检查处停下）
+        synchronized (infoQueue) { infoGen++; infoQueue.clear(); }
         bg.execute(() -> {
             teardownRemote();
             AppState st = AppState.get();
@@ -3200,13 +3215,23 @@ public class MainActivity extends Activity {
         if (!st.sessionReady()) { Toast.makeText(this, "先连接相机", Toast.LENGTH_SHORT).show(); return; }
         showPage(1);
         selInfoTv.setText("正在读取照片列表…");
+        // 新一轮列表 = 按需识别换代：旧队列作废（旧工作线程会在代次检查处自行退出）
+        synchronized (infoQueue) {
+            infoGen++;
+            infoQueue.clear();
+            infoFetchedOk = 0; infoFetchedFail = 0; infoFolderFound = 0;
+        }
+        infoStorageKey = st.storageIdentity;
         bg.execute(() -> {
             try {
-                // v0.6.2 渐进式列表（Z 30 实测「读取照片用时 7 分钟」对策）：
-                // 枚举拿到句柄后立即以骨架条目发布、页面先可操作；ObjectInfo 在后台逐项回填（节流刷新上墙）；
-                // 单项只许 1 次短超时重试（回填期命令通道读超时收紧到 10s，卡住不再 30s 空转），失败即占位
-                // （复用 v0.6.1 占位机制）；三段耗时（枚举/回填含最慢单项/缩略图）全程打日志供下轮定性。
-                // 缩略图不在本阶段预取：网格 getView 按可视区懒加载，且骨架条目不发请求、不与回填抢通道。
+                // v0.6.3 按需识别 + 跨会话缓存（Z 30 诊断定性：5505 个对象 × 约 55ms/项逐项串行 ≈ 7 分钟，
+                // 是全量回填的物理总和、不是超时也不是故障；Z fc 仅 69 张故十几秒无感）：
+                // 枚举仍以 format=0 一次拿全句柄（RAW 需要）；信息来源三路——
+                //  ①跨会话缓存命中：直接完整渲染、零请求；
+                //  ②缓存已知为文件夹（0x3001）的句柄：跳过识别、不入列；
+                //  ③未命中：只发骨架「待识别」，由可视区驱动（网格绑定 + 滚动前后各一屏预取）经命令通道
+                //    优先级门（用户操作 > 缩略图 > 信息获取）逐项取，取到即写缓存。
+                // 首次连接大卡仍渐进呈现（先出墙、滚动到哪识别到哪），重复连接同卡基本整表命中。
                 long enumT0 = System.currentTimeMillis();
                 int[] handles = null;
                 PtpIpClient.PtpException specErr = null;
@@ -3242,120 +3267,60 @@ public class MainActivity extends Activity {
                 long enumMs = System.currentTimeMillis() - enumT0;
                 Diag.op("PTP", "列表加载[1/3 枚举句柄]：共 " + totalHandles + " 个，耗时 " + enumMs + "ms");
 
-                // ---- 骨架先行：句柄倒序（相机句柄通常旧→新，新照片先上墙），信息回填中页面可先操作 ----
+                // ---- 缓存应用：命中完整渲染 / 已知文件夹剔除 / 未命中骨架待识别（句柄倒序，新照片先上墙） ----
+                final String skey = st.storageIdentity;
                 List<PhotoItem> list = new ArrayList<>();
+                int cacheHit = 0, folderSkip = 0, pending = 0;
+                int cntImg = 0, cntOther = 0;
                 for (int i = totalHandles - 1; i >= 0; i--) {
-                    PtpIpClient.ObjectInfo ph = new PtpIpClient.ObjectInfo();
-                    ph.filename = "读取中…";
-                    PhotoItem item = new PhotoItem(handles[i], ph);
-                    item.infoPending = true;
+                    int h = handles[i];
+                    InfoCache.Entry ce = InfoCache.get(skey, h);
+                    if (ce != null && ce.format == 0x3001) { folderSkip++; continue; }
+                    PhotoItem item;
+                    if (ce != null) {
+                        item = new PhotoItem(h, InfoCache.toObjectInfo(ce));
+                        item.infoFromCache = true;
+                        item.downloaded = DownloadRecord.isDownloaded(item.filename());
+                        cacheHit++;
+                        PhotoItem.Kind k = item.kind();
+                        if (k == PhotoItem.Kind.JPG || k == PhotoItem.Kind.NEF || k == PhotoItem.Kind.MP4) cntImg++;
+                        else cntOther++;
+                    } else {
+                        PtpIpClient.ObjectInfo ph = new PtpIpClient.ObjectInfo();
+                        ph.filename = "读取中…";
+                        item = new PhotoItem(h, ph);
+                        item.infoPending = true;
+                        pending++;
+                    }
                     list.add(item);
                 }
                 st.photos.clear();
                 st.photos.addAll(list);
-                photoLoadNote = null;
-                runOnUiThread(() -> {
-                    rebuildDisplay(); updateSelInfo(); updateAutoUi();
-                    selInfoTv.setText("已列出 " + totalHandles + " 张，照片信息读取中…");
-                });
-
-                // ---- 后台回填 ----
-                long fillT0 = System.currentTimeMillis();
-                int infoOk = 0, infoFail = 0, folderSkip = 0;
-                int firstFailRc = -1;
-                String firstFailMsg = null;
-                long maxItemMs = 0; int maxItemHandle = 0;
-                boolean reconnectTried = false;
-                List<PhotoItem> folders = new ArrayList<>();
-                st.client.setCmdSoTimeout(10000); // 回填期短超时（无字节停顿口径）
-                try {
-                    long lastUiMs = 0;
-                    for (PhotoItem item : list) {
-                        long itemT0 = System.currentTimeMillis();
-                        PtpIpClient.ObjectInfo oi = null;
-                        Exception fail = null;
-                        try {
-                            oi = st.client.getObjectInfo(item.handle);
-                        } catch (Exception e1) {
-                            // 单项只许 1 次重试：IO 型（通道已判死）先重连一次再重试；相机层错误直接重试一次
-                            boolean ioDead = e1 instanceof PtpIpClient.PtpException
-                                    && ((PtpIpClient.PtpException) e1).responseCode == -1;
-                            if (ioDead && !reconnectTried) {
-                                reconnectTried = true;
-                                Diag.op("PTP", "回填中通道断裂，尝试重连一次后重试该项 handle=0x"
-                                        + Integer.toHexString(item.handle));
-                                if (!st.client.isConnected()) st.client.reconnect(st.network);
-                            }
-                            if (!ioDead || st.client.isConnected()) {
-                                try { oi = st.client.getObjectInfo(item.handle); }
-                                catch (Exception e2) { fail = e2; }
-                            } else {
-                                fail = e1;
-                            }
-                        }
-                        long itemMs = System.currentTimeMillis() - itemT0;
-                        if (itemMs > maxItemMs) { maxItemMs = itemMs; maxItemHandle = item.handle; }
-                        if (oi != null) {
-                            if (oi.format == 0x3001) { folderSkip++; folders.add(item); }
-                            else { item.info = oi; infoOk++; }
-                        } else {
-                            int rc = fail instanceof PtpIpClient.PtpException
-                                    ? ((PtpIpClient.PtpException) fail).responseCode : -1;
-                            infoFail++;
-                            if (firstFailMsg == null) {
-                                firstFailRc = rc;
-                                firstFailMsg = fail != null ? fail.getMessage() : "?";
-                            }
-                            Diag.op("PTP", "GetObjectInfo 失败 handle=0x" + Integer.toHexString(item.handle)
-                                    + " rc=0x" + Integer.toHexString(rc) + "："
-                                    + (fail != null ? fail.getMessage() : "?") + "（占位保留，不丢弃整表）");
-                            PtpIpClient.ObjectInfo ph = new PtpIpClient.ObjectInfo();
-                            ph.filename = "未知文件（0x" + Integer.toHexString(item.handle) + "）";
-                            item.info = ph;
-                            item.infoFailed = true;
-                            item.infoFailRc = rc;
-                        }
-                        item.infoPending = false;
-                        long nowMs = System.currentTimeMillis();
-                        if (nowMs - lastUiMs > 600) { // 节流刷新，已回填条目陆续上墙
-                            lastUiMs = nowMs;
-                            runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); });
-                        }
-                    }
-                    list.removeAll(folders);
-                } finally {
-                    st.client.setCmdSoTimeout(30000);
-                }
-                long fillMs = System.currentTimeMillis() - fillT0;
-                Diag.op("PTP", "列表加载[2/3 信息回填]：耗时 " + fillMs + "ms，成功 " + infoOk
-                        + "，失败 " + infoFail + "（占位保留）"
-                        + (folderSkip > 0 ? "，文件夹跳过 " + folderSkip : "")
-                        + "，最慢单项 " + maxItemMs + "ms（handle=0x" + Integer.toHexString(maxItemHandle) + "）"
-                        + (firstFailMsg != null ? "，首个失败 rc=0x" + Integer.toHexString(firstFailRc) + "：" + firstFailMsg : ""));
-                Diag.op("PTP", "列表加载[3/3 缩略图]：加载阶段不预取，网格按可视区懒加载");
-                Collections.sort(list, (a, b) -> b.sortKey().compareTo(a.sortKey())); // 新→旧
-                int dlCount = 0;
-                for (PhotoItem p : list) {
-                    p.downloaded = DownloadRecord.isDownloaded(p.filename());
-                    if (p.downloaded) dlCount++;
-                }
-                st.photos.clear();
-                st.photos.addAll(list);
-                // v0.6.1：为空必须给出具体原因（空状态卡显示），禁止静默空白
+                final int pendingFinal = pending;
+                Diag.op("PTP", "列表加载[2/3 信息来源]：缓存命中 " + cacheHit + " / 待按需识别 " + pending
+                        + " / 占位 0（识别失败时才产生）"
+                        + "；命中率 " + (cacheHit + pending > 0 ? (cacheHit * 100 / (cacheHit + pending)) : 100) + "%"
+                        + "（缓存文件 " + InfoCache.storeBytes() + " B）");
+                Diag.op("PTP", "列表加载[3/3 对象构成]（缓存已知部分）：图片 " + cntImg + " / 文件夹 " + folderSkip
+                        + " / 其他 " + cntOther + " / 待识别 " + pending
+                        + "（缩略图仍按可视区懒加载；信息只取可视区及前后各一屏，不再全量回填）");
                 if (list.isEmpty()) {
                     photoLoadNote = totalHandles == 0
                             ? "相机返回 0 个对象：卡上没有照片，或当前连接方式下相机未开放照片访问（可换另一种连接方式再试）；细节见诊断页。"
                             : "相机返回 " + totalHandles + " 个对象，但全部是文件夹、没有照片文件；细节见诊断页。";
-                } else if (infoFail > 0 && infoOk == 0) {
-                    photoLoadNote = null; // 占位条目已进列表，数量与原因在条目上可见，不再占空状态
-                    Diag.op("PTP", "照片信息全部读取失败，已以占位条目保留 " + list.size() + " 条（首个失败码 0x"
-                            + Integer.toHexString(firstFailRc) + "）");
                 } else {
                     photoLoadNote = null;
                 }
+                int dlCount = 0;
+                for (PhotoItem p : list) if (p.downloaded) dlCount++;
                 Diag.op("PTP", "照片列表就绪：" + list.size() + " 张（其中已下载 " + dlCount + " 张，据已下载记录 "
-                        + DownloadRecord.count() + " 条比对），枚举+回填总耗时 " + (enumMs + fillMs) + "ms");
-                runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); updateAutoUi(); });
+                        + DownloadRecord.count() + " 条比对），枚举耗时 " + enumMs + "ms"
+                        + (pendingFinal > 0 ? "；另有 " + pendingFinal + " 张待滚动到可视区时逐张识别" : "；全部信息已就绪（缓存命中）"));
+                InfoCache.flush();
+                runOnUiThread(() -> {
+                    rebuildDisplay(); updateSelInfo(); updateAutoUi();
+                    enqueueInfoAroundVisible(); // 已在可视区的条目立即入队识别（getView 绑定也会入队，双保险）
+                });
             } catch (Exception e) {
                 Diag.op("PTP", "读取照片失败：" + e.getMessage());
                 photoLoadNote = "读取照片失败：" + e.getMessage() + "（细节见诊断页）";
@@ -3365,6 +3330,160 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    // ================= v0.6.3 按需识别（可视区驱动的 ObjectInfo 获取） =================
+
+    /** 待识别句柄队列（插入序 = 入队序，滚动预取按此先后取）；infoGen 换代即作废旧队列 */
+    private final java.util.LinkedHashSet<Integer> infoQueue = new java.util.LinkedHashSet<>();
+    private volatile int infoGen = 0;
+    private volatile boolean infoWorkerActive = false;
+    private volatile String infoStorageKey = "";
+    private int infoFetchedOk = 0, infoFetchedFail = 0, infoFolderFound = 0; // 仅诊断小结用
+
+    /** 入队一个待识别条目（重复入队无副作用）；在任意线程可调 */
+    private void enqueueInfo(PhotoItem item) {
+        if (item == null || !item.infoPending) return;
+        synchronized (infoQueue) { infoQueue.add(item.handle); }
+        kickInfoWorker();
+    }
+
+    /** 按展示行范围入队：可视区 + 前后各一屏（屏高按行数计），滚动监听与列表发布后调用；UI 线程调用 */
+    private void enqueueInfoAround(int firstRow, int visibleRows, int totalRows) {
+        if (totalRows <= 0 || displayRows.isEmpty()) return;
+        int screen = Math.max(visibleRows, 1);
+        int from = Math.max(0, firstRow - screen);
+        int to = Math.min(totalRows - 1, firstRow + visibleRows - 1 + screen);
+        for (int pos = from; pos <= to; pos++) {
+            if (pos < 0 || pos >= displayRows.size()) continue;
+            GalleryRow row = displayRows.get(pos);
+            for (PhotoItem p : row.files()) enqueueInfo(p);
+        }
+    }
+
+    /** 以网格当前可视位置为中心入队（布局未完成时 getView 绑定会另行入队，不漏） */
+    private void enqueueInfoAroundVisible() {
+        if (grid == null || displayRows.isEmpty()) return;
+        int first = grid.getFirstVisiblePosition();
+        int last = grid.getLastVisiblePosition();
+        if (first < 0) first = 0;
+        int vis = last >= first ? last - first + 1 : 9;
+        enqueueInfoAround(first, vis, displayRows.size());
+    }
+
+    private PhotoItem findPhoto(int handle) {
+        for (PhotoItem p : AppState.get().photos) if (p.handle == handle) return p;
+        return null;
+    }
+
+    /** 按需识别工作线程：逐项取 Info，每项都经命令通道优先级门让行（用户操作/缩略图优先）；队列取空即退 */
+    private void kickInfoWorker() {
+        synchronized (infoQueue) {
+            if (infoWorkerActive) return;
+            infoWorkerActive = true;
+        }
+        final int gen = infoGen;
+        final PtpIpClient client0 = AppState.get().client;
+        final long yield0 = client0 != null ? client0.getInfoYieldCount() : 0;
+        infoExec.execute(() -> {
+            AppState st = AppState.get();
+            long lastUiMs = 0;
+            long lastReconnectTryMs = 0;
+            try {
+                while (true) {
+                    Integer h;
+                    synchronized (infoQueue) {
+                        if (gen != infoGen || infoQueue.isEmpty()) break;
+                        java.util.Iterator<Integer> it = infoQueue.iterator();
+                        h = it.next(); it.remove();
+                    }
+                    PhotoItem item = findPhoto(h);
+                    if (item == null || !item.infoPending) continue;
+                    PtpIpClient client = st.client;
+                    if (client == null || !client.isConnected()) break; // 断线即停，条目保持待识别
+                    lastReconnectTryMs = fetchOneInfo(st, client, item, lastReconnectTryMs);
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastUiMs > 600) { // 节流刷新，识别结果陆续上墙
+                        lastUiMs = nowMs;
+                        runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); });
+                    }
+                }
+            } finally {
+                synchronized (infoQueue) { infoWorkerActive = false; }
+                if (gen == infoGen && (infoFetchedOk > 0 || infoFetchedFail > 0)) {
+                    long yieldDelta = (client0 != null ? client0.getInfoYieldCount() : yield0) - yield0;
+                    Diag.op("PTP", "按需识别小结：本轮新取 " + infoFetchedOk + "，失败 " + infoFetchedFail
+                            + "，其中文件夹 " + infoFolderFound + "（已剔除并缓存结论）"
+                            + "，信息获取让行 " + yieldDelta + " 次（用户操作/缩略图优先）");
+                }
+                InfoCache.flush();
+                runOnUiThread(() -> { rebuildDisplay(); updateSelInfo(); });
+                // 收尾竞态兜底：finally 期间新入队的条目再踢一脚
+                synchronized (infoQueue) {
+                    if (gen == infoGen && !infoQueue.isEmpty()) kickInfoWorker();
+                }
+            }
+        });
+    }
+
+    /**
+     * 取单个条目的 ObjectInfo（识别期命令通道读超时收紧到 10s，无字节停顿口径；单项只许 1 次重试，
+     * IO 型先按节流重连再重试）；成功写缓存，文件夹剔除并缓存结论，失败走 v0.6.1 占位机制。
+     * 返回更新后的 lastReconnectTryMs。
+     */
+    private long fetchOneInfo(AppState st, PtpIpClient client, PhotoItem item, long lastReconnectTryMs) {
+        client.setCmdSoTimeout(10000);
+        try {
+            PtpIpClient.ObjectInfo oi = null;
+            Exception fail = null;
+            try {
+                oi = client.getObjectInfo(item.handle);
+            } catch (Exception e1) {
+                boolean ioDead = e1 instanceof PtpIpClient.PtpException
+                        && ((PtpIpClient.PtpException) e1).responseCode == -1;
+                long now = System.currentTimeMillis();
+                if (ioDead && !client.isConnected() && now - lastReconnectTryMs > 30000) {
+                    lastReconnectTryMs = now;
+                    Diag.op("PTP", "按需识别中通道断裂，尝试重连一次后重试该项 handle=0x"
+                            + Integer.toHexString(item.handle));
+                    client.reconnect(st.network);
+                }
+                if (!ioDead || client.isConnected()) {
+                    try { oi = client.getObjectInfo(item.handle); }
+                    catch (Exception e2) { fail = e2; }
+                } else {
+                    fail = e1;
+                }
+            }
+            if (oi != null) {
+                InfoCache.put(infoStorageKey, oi, item.handle); // 文件夹结论也缓存：下次连接直接跳过
+                if (oi.format == 0x3001) {
+                    st.photos.remove(item);
+                    infoFolderFound++;
+                } else {
+                    item.info = oi;
+                    item.infoFromCache = false;
+                    item.downloaded = DownloadRecord.isDownloaded(oi.filename);
+                    infoFetchedOk++;
+                }
+            } else {
+                int rc = fail instanceof PtpIpClient.PtpException
+                        ? ((PtpIpClient.PtpException) fail).responseCode : -1;
+                infoFetchedFail++;
+                Diag.op("PTP", "GetObjectInfo 失败 handle=0x" + Integer.toHexString(item.handle)
+                        + " rc=0x" + Integer.toHexString(rc) + "："
+                        + (fail != null ? fail.getMessage() : "?") + "（占位保留，不丢弃整表）");
+                PtpIpClient.ObjectInfo ph = new PtpIpClient.ObjectInfo();
+                ph.filename = "未知文件（0x" + Integer.toHexString(item.handle) + "）";
+                item.info = ph;
+                item.infoFailed = true;
+                item.infoFailRc = rc;
+            }
+            item.infoPending = false;
+            return lastReconnectTryMs;
+        } finally {
+            client.setCmdSoTimeout(30000);
+        }
     }
 
     private void updateSelInfo() {
@@ -3392,7 +3511,7 @@ public class MainActivity extends Activity {
         for (PhotoItem p : selectedFiles()) {
             if (p.infoPending) { skippedPending++; continue; } // v0.6.2：骨架条目（双保险，正常已被勾选守卫挡住）
             if (p.infoFailed) { skippedFailed++; continue; } // v0.6.1：占位条目不入队，给中文提示
-            jobs.add(new DownloadService.Job(p.handle, p.filename(), p.size()));
+            jobs.add(new DownloadService.Job(p.handle, p.filename(), p.size(), p.infoFromCache));
         }
         if (skippedPending > 0) {
             Toast.makeText(this, "有 " + skippedPending + " 张照片信息还在读取中，请稍候再下载", Toast.LENGTH_LONG).show();
@@ -3421,6 +3540,8 @@ public class MainActivity extends Activity {
         @Override public View getView(int pos, View convertView, ViewGroup parent) {
             final GalleryRow row = displayRows.get(pos);
             final PhotoItem thumbItem = row.jpgMember(); // 配对行缩略图取 JPG 成员
+            // v0.6.3：绑定即入队——本行成员有待识别的就排队取 Info（可视区驱动；滚动预取在 OnScrollListener）
+            for (PhotoItem p : row.files()) if (p.infoPending) enqueueInfo(p);
             FrameLayout cell;
             ImageView thumbIv, checkIv, badgeIv, badge2Iv;
             TextView nameTv, chipTv, selTv;
@@ -3525,9 +3646,9 @@ public class MainActivity extends Activity {
             }
             // 缩略图：缓存命中直接用；未命中先放矢量占位（格式徽标放大），异步加载回来再换
             // v0.6.1：信息读取失败的占位条目不发缩略图请求（句柄信息不全），角标直接标原因
-            // v0.6.2：骨架条目（回填中）同样不发请求——缩略图严格按可视区懒加载且不与回填抢命令通道，
-            //         回填完成后整表刷新，可视区条目届时再逐格加载
-            boolean thumbBlocked = thumbItem.infoFailed || thumbItem.infoPending;
+            // v0.6.3：待识别条目放行缩略图（只需句柄）——命令通道优先级为 缩略图 > 信息获取，
+            //         先出图、名字随后由按需识别补上；识别失败的条目仍不发请求
+            boolean thumbBlocked = thumbItem.infoFailed;
             Bitmap bmp = thumbBlocked ? null : thumbCache.getMem(thumbItem.handle);
             thumbIv.setTag(thumbItem.handle);
             if (thumbItem.infoFailed) {

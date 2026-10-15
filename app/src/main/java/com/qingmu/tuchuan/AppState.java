@@ -19,6 +19,8 @@ public final class AppState {
     public int battery = -1;
     public int storageId = 0;
     public String storageDesc = "";
+    /** v0.6.3：ObjectInfo 缓存的存储标识（GetStorageInfo 描述+卷标+总容量组装，连接时写入；换卡即换键） */
+    public String storageIdentity = "";
     public final List<PhotoItem> photos = new ArrayList<>();
 
     private AppState() {}
@@ -26,7 +28,7 @@ public final class AppState {
     public boolean sessionReady() { return client != null && client.isConnected(); }
 
     public void resetSession() {
-        deviceInfo = null; battery = -1; storageId = 0; storageDesc = "";
+        deviceInfo = null; battery = -1; storageId = 0; storageDesc = ""; storageIdentity = "";
         photos.clear();
     }
 }
