@@ -23,6 +23,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 下载前台 Service：队列顺序下载，通知栏显示进度，WakeLock 保活。
  *
  * 续传/降级链（全程记诊断）：
+ *  0) v0.6.2 起客户端 downloadObject 本身是断点续传型：GetObject 整流被相机提前收尾时，
+ *     同会话内自动转 GetPartialObject 从已收偏移续拉（短读接受、分块自适应缩小、[DL] 全程记录），
+ *     本 Service 的 .part 机制降为跨会话/跨重连的外层安全网
  *  1) .part 存在 → GetPartialObject 从 .part 长度续传（profile 禁用 Partial 时直接走 3）
  *  2) Partial 相机报错（响应码非 OK）→ 删 .part，整文件 GetObject 重下一次
  *  3) IO 断裂 → PtpIpClient.reconnect() 指数退避重连+重建会话，成功则从 .part 继续（最多 4 轮）
@@ -79,7 +82,11 @@ public class DownloadService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (RUNNING.compareAndSet(false, true)) {
-            new Thread(this::workLoop, "guga-dl").start();
+            Thread t = new Thread(this::workLoop, "guga-dl");
+            // v0.6.2：下载线程未捕获异常只记 [GUARD]，不许直达系统默认处理器杀进程
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    Diag.op("GUARD", "下载线程未捕获异常（已拦截，App 未退出）：" + ex));
+            t.start();
         }
         return START_STICKY;
     }
@@ -188,7 +195,10 @@ public class DownloadService extends Service {
                 });
                 break; // 下载成功
             } catch (PtpIpClient.PtpException e) {
-                if (e.responseCode == -1) {
+                if (e.responseCode == PtpIpClient.RC_RESUME_EXHAUSTED) {
+                    // v0.6.2：客户端内续拉已达上限——.part 里的已收字节有效，保留待下次继续，不删不重下
+                    throw new Exception("下载多次中断未完成（已收部分已保留为断点，下次点下载会继续）：" + e.getMessage());
+                } else if (e.responseCode == -1) {
                     // IO 断裂 → 重连后从 .part 续
                     ioCycles++;
                     Diag.op("DL", "IO 断裂（第 " + ioCycles + " 轮）：" + e.getMessage());

@@ -191,6 +191,47 @@ public class PtpIpClient {
     private int reconnectCount = 0;
     private volatile ConnectionListener connListener;
 
+    // ---- v0.6.2 掉线取证（STA「点任何处退出」定性）：记录最后一个操作/响应码/IO 异常，markDead 时整行打出 ----
+    private volatile boolean staSession = false; // 本次连接是否为 STA（network==null，连接至 PC）
+    private volatile String lastOpDesc = "（无）";
+    private volatile int lastOpRc = 0;
+    private volatile String lastIoDetail = "（无）";
+    private volatile int cmdSoTimeoutMs = 30000;
+
+    /** 当前连接是否为 STA（连接至 PC）模式 */
+    public boolean isStaSession() { return staSession; }
+
+    /** 调节命令通道读超时（socket SO_TIMEOUT 本就是「无字节停顿」超时：每次读到数据即重新计） */
+    public synchronized void setCmdSoTimeout(int ms) {
+        cmdSoTimeoutMs = ms;
+        if (cmdSock != null) {
+            try { cmdSock.setSoTimeout(ms); } catch (Exception ignore) {}
+        }
+    }
+
+    /** 常用操作码可读名（掉线取证/日志用；未列出的回退十六进制） */
+    static String opNameOf(int op) {
+        switch (op) {
+            case OP_GET_DEVICE_INFO: return "GetDeviceInfo";
+            case OP_OPEN_SESSION: return "OpenSession";
+            case OP_CLOSE_SESSION: return "CloseSession";
+            case OP_GET_STORAGE_IDS: return "GetStorageIDs";
+            case OP_GET_STORAGE_INFO: return "GetStorageInfo";
+            case OP_GET_OBJECT_HANDLES: return "GetObjectHandles";
+            case OP_GET_OBJECT_INFO: return "GetObjectInfo";
+            case OP_GET_OBJECT: return "GetObject";
+            case OP_GET_THUMB: return "GetThumb";
+            case OP_GET_PARTIAL_OBJECT: return "GetPartialObject";
+            case OP_GET_DEVICE_PROP_VALUE: return "GetDevicePropValue";
+            case OP_GET_DEVICE_PROP_DESC: return "GetDevicePropDesc";
+            case OP_SET_DEVICE_PROP_VALUE: return "SetDevicePropValue";
+            case OP_DELETE_OBJECT: return "DeleteObject";
+            case OP_FORMAT_STORE: return "FormatStore";
+            case OP_INITIATE_CAPTURE: return "InitiateCapture";
+            default: return "op0x" + Integer.toHexString(op);
+        }
+    }
+
     public PtpIpClient(byte[] initiatorGuid, String initiatorName) {
         this.initiatorGuid = initiatorGuid != null && initiatorGuid.length == 16
                 ? initiatorGuid.clone() : new byte[16];
@@ -231,12 +272,13 @@ public class PtpIpClient {
     public synchronized void connect(Network network, String h, int p) throws IOException {
         closeQuietly();
         closing = false;
+        staSession = (network == null);
         this.host = h; this.port = p;
         Diag.op("PTPIP", "连接命令通道 " + h + ":" + p + (network != null ? "（经相机热点 Network）" : "（默认网络）"));
         cmdSock = newSocket(network);
         cmdSock.connect(new InetSocketAddress(h, p), 8000);
         cmdSock.setTcpNoDelay(true);
-        cmdSock.setSoTimeout(30000);
+        cmdSock.setSoTimeout(cmdSoTimeoutMs);
         cmdIn = cmdSock.getInputStream();
         cmdOut = cmdSock.getOutputStream();
 
@@ -467,11 +509,25 @@ public class PtpIpClient {
     private void markDead(String reason) {
         if (!connected) return;
         connected = false;
+        // v0.6.2 掉线取证：把模式/最后一个操作/最后响应码/socket 异常/事件通道静默时长一次打全，
+        // STA 模式下用 [STA] 前缀，与 [CRASH]/[GUARD] 一起构成下轮定性证据链。
+        long evtSilent = lastEvtRxMs > 0 ? (System.currentTimeMillis() - lastEvtRxMs) : -1;
+        Diag.op(staSession ? "STA" : "PTPIP", "连接判死（模式=" + (staSession ? "STA 连接至PC" : "AP 相机热点")
+                + "）：原因=" + reason
+                + "｜最后一个操作=" + lastOpDesc
+                + "｜最后响应码=0x" + Integer.toHexString(lastOpRc)
+                + "｜最后 socket 异常=" + lastIoDetail
+                + (evtSilent >= 0 ? "｜事件通道已静默 " + evtSilent + "ms" : ""));
         for (Socket s : new Socket[]{cmdSock, evtSock}) {
             if (s != null) try { s.close(); } catch (Exception ignore) {}
         }
         ConnectionListener l = connListener;
-        if (l != null) l.onDisconnected(reason);
+        if (l != null) {
+            // 监听方在 PTP 线程上被回调，其异常绝不许反噬杀掉调用线程/进程
+            try { l.onDisconnected(reason); } catch (Throwable t) {
+                Diag.op("GUARD", "断线回调异常已拦截（App 未退出）：" + t);
+            }
+        }
     }
 
     // ================= 操作层 =================
@@ -501,6 +557,7 @@ public class PtpIpClient {
             // 事务 ID 由 transact 统一分配递增（v0.2 审计修复：原实现各调用方手动 ++，异常路径会漏增导致 tid 复用）
             int tid = transactionId++;
             cmdBusy = true;
+            lastOpDesc = opNameOf(opCode) + "(0x" + Integer.toHexString(opCode) + ") tid=" + tid;
             int n = params == null ? 0 : params.length;
             byte[] req = new byte[18 + 4 * n];
             Le.put32(req, 0, req.length);
@@ -543,6 +600,7 @@ public class PtpIpClient {
                             Diag.op("PTP", opName + " 数据阶段收到意外包 type=" + pkt.type);
                     }
                 }
+                lastOpRc = respCode;
                 if (respCode != RC_OK) {
                     Diag.op("PTP", opName + " tid=" + tid + " 响应码 0x" + Integer.toHexString(respCode) + "（非 OK）");
                     throw new PtpException("op " + opName + " rc=0x" + Integer.toHexString(respCode), respCode);
@@ -558,6 +616,7 @@ public class PtpIpClient {
                 throw e;
             } catch (IOException e) {
                 cmdBusy = false;
+                lastIoDetail = e.getClass().getSimpleName() + "：" + e.getMessage();
                 Diag.op("PTP", opName + " tid=" + tid + " IO 异常：" + e.getMessage());
                 markDead("命令通道 IO 异常");
                 throw new PtpException("op " + opName + " IO: " + e.getMessage(), e);
@@ -1031,50 +1090,125 @@ public class PtpIpClient {
         return r.data != null ? r.data : new byte[0];
     }
 
+    /** 下载续传事件超限（非 IO 断裂、非相机拒绝）：上层据此给中文失败结论，.part 保留待下次续 */
+    public static final int RC_RESUME_EXHAUSTED = -6;
+    /** 下载期读超时（无字节停顿口径，socket SO_TIMEOUT：每次读到数据重新计，不是总时长） */
+    private static final int DL_STALL_TIMEOUT_MS = 20000;
+    private static final int DL_MAX_RESUME_EVENTS = 40;
+
+    /** 流式计数接收端：写出到 out、累计字节、记录 StartData 声明总量、按绝对偏移回调进度 */
+    private static class StreamCounter implements DataSink {
+        final OutputStream out; final Progress progress; final long base;
+        long count = 0; long declared = -1;
+        StreamCounter(OutputStream out, Progress progress, long base) {
+            this.out = out; this.progress = progress; this.base = base;
+        }
+        public void onTotal(long total) { declared = total; }
+        public void onData(byte[] buf, int off, int len) throws IOException {
+            out.write(buf, off, len);
+            count += len;
+            if (progress != null) progress.onProgress(base + count);
+        }
+    }
+
+    private static long effectiveExpected(long totalSize, long declared) {
+        if (totalSize > 0) return totalSize;
+        if (declared > 0 && declared < (1L << 62)) return declared;
+        return -1;
+    }
+
+    private static int shrinkChunk(int chunk) {
+        if (chunk > 1024 * 1024) return 1024 * 1024;
+        if (chunk > 256 * 1024) return 256 * 1024;
+        return 256 * 1024;
+    }
+
     /**
-     * 下载对象到 out。
-     * startOffset=0 → GetObject 整流；>0 → GetPartialObject 分块续传（每块 4MB）。
-     * 相机不支持 GetPartialObject（响应码非 OK）会抛 PtpException，由上层降级整文件重下。
+     * 下载对象到 out（v0.6.2 断点续传型重写）。
+     *
+     * 背景实锤（Z 30 外部复测）：25.4MB 文件（期望 26,607,616 B）下载时相机在数据阶段
+     * 提前收尾（Response 先到），旧实现不核对已收字节、把截断当成功返回，上层长度校验才发现
+     * 只收到 11,469,206 B。新链路：
+     *  1) startOffset=0 先试 GetObject 整流，但按 StartData 声明总量 / ObjectInfo 期望核对已收字节；
+     *     提前收尾不判失败——记 [DL] 后转 GetPartialObject 从已收偏移续拉（通道仍同步，可同会话续）；
+     *  2) GetPartialObject 分块拉取：短读（rc=OK 但字节少于请求）接受已到字节并推进偏移，
+     *     分块自适应缩小 4MB → 1MB → 256KB；连续 0 字节按数据停顿处理（抛 IO 型异常走上层重连）；
+     *  3) 读超时为 socket SO_TIMEOUT 的无字节停顿口径：下载期临时收紧为 20s，结束恢复；
+     *  4) 续拉事件有上限（RC_RESUME_EXHAUSTED），全部续完才返回成功，最终长度仍由上层校验。
+     * 相机拒绝 GetPartialObject（响应码非 OK / profile 禁用）照旧抛 PtpException，交上层降级整传；
+     * IO 断裂抛 rc=-1，交上层重连后从 .part 续。
      */
     public void downloadObject(int handle, long totalSize, long startOffset,
                                OutputStream out, Progress progress) throws PtpException, IOException {
-        if (startOffset <= 0) {
-            final long[] done = {0};
-            transact(OP_GET_OBJECT, new int[]{handle}, new DataSink() {
-                public void onTotal(long total) {}
-                public void onData(byte[] buf, int off, int len) throws IOException {
-                    out.write(buf, off, len);
-                    done[0] += len;
-                    if (progress != null) progress.onProgress(done[0]);
-                }
-            });
-            return;
-        }
-        if (startOffset > 0 && profile != null && !profile.tryPartialObject) {
-            Diag.op("PTP", "profile[" + profile.id + "] 禁用 GetPartialObject，交由上层降级整文件下载");
-            throw new PtpException("profile 禁用 GetPartialObject", -4);
-        }
-        long offset = startOffset;
-        final long base = startOffset;
-        final int CHUNK = 4 * 1024 * 1024;
-        while (offset < totalSize) {
-            if (offset > 0xFFFFFFFFL) {
-                throw new PtpException("续传偏移超过 GetPartialObject 32 位上限 offset=" + offset, -2);
+        int prevTimeout = cmdSoTimeoutMs;
+        setCmdSoTimeout(DL_STALL_TIMEOUT_MS);
+        try {
+            long offset = startOffset > 0 ? startOffset : 0;
+            long declared = -1;
+            // ---- 阶段 1：整流（仅从 0 开始时） ----
+            if (startOffset <= 0) {
+                StreamCounter sink = new StreamCounter(out, progress, 0);
+                transact(OP_GET_OBJECT, new int[]{handle}, sink);
+                offset = sink.count;
+                declared = sink.declared;
+                long expected = effectiveExpected(totalSize, declared);
+                if (expected < 0 || offset >= expected) return; // 完整，或无从核对（按整流结果交付）
+                Diag.op("DL", "GetObject 整流提前收尾：已收 " + offset + " / 期望 " + expected
+                        + "（相机数据阶段提前结束），转 GetPartialObject 续拉");
             }
-            int want = (int) Math.min(CHUNK, totalSize - offset);
-            final long[] got = {0};
-            final long offSnapshot = offset;
-            transact(OP_GET_PARTIAL_OBJECT, new int[]{handle, (int) offset, want}, new DataSink() {
-                public void onTotal(long total) {}
-                public void onData(byte[] buf, int o, int len) throws IOException {
-                    out.write(buf, o, len);
-                    got[0] += len;
-                    if (progress != null) progress.onProgress(base + (offSnapshot - base) + got[0]);
+            // ---- 阶段 2：GetPartialObject 续拉 ----
+            if (profile != null && !profile.tryPartialObject) {
+                Diag.op("PTP", "profile[" + profile.id + "] 禁用 GetPartialObject，交由上层降级整文件下载");
+                throw new PtpException("profile 禁用 GetPartialObject", -4);
+            }
+            long expected = effectiveExpected(totalSize, declared);
+            int chunk = 4 * 1024 * 1024;
+            int resumeEvents = 0, zeroStreak = 0;
+            while (true) {
+                if (expected > 0 && offset >= expected) break;
+                if (offset > 0xFFFFFFFFL) {
+                    throw new PtpException("续传偏移超过 GetPartialObject 32 位上限 offset=" + offset, -2);
                 }
-            });
-            if (got[0] <= 0) throw new PtpException("GetPartialObject 返回 0 字节 @offset=" + offset, -3);
-            offset += got[0];
-            Diag.op("PTP", "续传块完成 offset=" + offset + "/" + totalSize);
+                int want = expected > 0 ? (int) Math.min(chunk, expected - offset) : chunk;
+                StreamCounter sink = new StreamCounter(out, progress, offset);
+                transact(OP_GET_PARTIAL_OBJECT, new int[]{handle, (int) offset, want}, sink);
+                long got = sink.count;
+                if (got <= 0) {
+                    zeroStreak++;
+                    resumeEvents++;
+                    int old = chunk; chunk = shrinkChunk(chunk);
+                    Diag.op("DL", "续传 0 字节（连续第 " + zeroStreak + " 次）：offset=" + offset
+                            + " 已收=" + offset + " 期望=" + expected + "，分块 " + old + "→" + chunk);
+                    if (zeroStreak >= 3) {
+                        throw new PtpException("GetPartialObject 连续 0 字节 @offset=" + offset,
+                                new IOException("相机数据停顿"));
+                    }
+                    if (resumeEvents > DL_MAX_RESUME_EVENTS) {
+                        throw new PtpException("续传事件超限（" + DL_MAX_RESUME_EVENTS + " 次） @offset=" + offset,
+                                RC_RESUME_EXHAUSTED);
+                    }
+                    continue;
+                }
+                zeroStreak = 0;
+                offset += got;
+                Diag.op("DL", "续传块完成：已收=" + offset + " 期望=" + expected);
+                if (got < want) {
+                    if (expected <= 0) break; // 无期望口径：短读即数据结束
+                    resumeEvents++;
+                    int old = chunk; chunk = shrinkChunk(chunk);
+                    Diag.op("DL", "续传：短读 " + got + "/" + want + "，已收=" + offset + " 期望=" + expected
+                            + "，分块 " + old + "→" + chunk);
+                    if (resumeEvents > DL_MAX_RESUME_EVENTS) {
+                        throw new PtpException("续传事件超限（" + DL_MAX_RESUME_EVENTS + " 次） @offset=" + offset,
+                                RC_RESUME_EXHAUSTED);
+                    }
+                }
+            }
+            if (expected > 0 && offset != expected) {
+                throw new PtpException("长度仍不完整：已收 " + offset + " 期望 " + expected, RC_RESUME_EXHAUSTED);
+            }
+        } finally {
+            setCmdSoTimeout(prevTimeout);
         }
     }
 

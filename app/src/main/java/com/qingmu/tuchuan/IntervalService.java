@@ -70,7 +70,11 @@ public class IntervalService extends Service {
             final int intervalSec = Math.max(1, intent.getIntExtra(EXTRA_INTERVAL_SEC, 5));
             final int total = Math.max(0, intent.getIntExtra(EXTRA_TOTAL, 0));
             STOP.set(false);
-            new Thread(() -> workLoop(intervalSec, total), "qingmu-interval").start();
+            Thread t = new Thread(() -> workLoop(intervalSec, total), "qingmu-interval");
+            // v0.6.2：间隔拍摄线程未捕获异常只记 [GUARD]，不许直达系统默认处理器杀进程
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    Diag.op("GUARD", "间隔拍摄线程未捕获异常（已拦截，App 未退出）：" + ex));
+            t.start();
         }
         return START_STICKY;
     }

@@ -51,8 +51,9 @@ public final class CameraProfile {
 
     public static final CameraProfile Z_50_30 = new CameraProfile(
             "Z_50_30", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,
-            "Z 50/Z 30 与 Z fc 同代 Z 系 FULL 档。Z 30 数据来源：外部用户 2026-10-14 在 v0.6.0 实测——AP 连接、遥控拍照可用；"
-            + "手选清晰档被打回、照片枚举回 0、STA 点按钮退出三项已在 v0.6.1 针对性热修（待复测）；Z 50 本体待真机验证");
+            "Z 50/Z 30 与 Z fc 同代 Z 系 FULL 档。Z 30 数据来源：外部用户实测——AP 连接、遥控拍照可用；"
+            + "v0.6.0 三问题（手选清晰档被打回/枚举回 0/STA 退出）经 v0.6.1 热修后，2026-10-15 复测：照片列表已能读出，"
+            + "但列表加载耗时 7 分钟、25.4MB 下载中途截断、STA 仍退出——v0.6.2 已针对性处理（渐进式列表/下载断点续传/退出路径审计+掉线取证，待复测）；Z 50 本体待真机验证");
 
     public static final CameraProfile Z_FULLFRAME = new CameraProfile(
             "Z_FULLFRAME", true, true, ThumbFallback.PLACEHOLDER_RETRY, RemoteLevel.FULL,

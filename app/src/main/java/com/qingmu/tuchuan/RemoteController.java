@@ -74,7 +74,8 @@ public class RemoteController {
     private final CameraProfile profile;
     private volatile boolean experimental;
     private final Ui ui;
-    private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private final ExecutorService exec =
+            Executors.newSingleThreadExecutor(MainActivity.guardedThreads("qingmu-remote"));
     private final Set<String> deadFeatures = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<String, Integer> failCounts = new ConcurrentHashMap<>();
 
@@ -137,9 +138,8 @@ public class RemoteController {
     private final ConcurrentHashMap<Integer, Long> lastRefreshAt = new ConcurrentHashMap<>();
     private final Set<Integer> refreshPending = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.ScheduledExecutorService debounce =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "qingmu-prop-debounce"); t.setDaemon(true); return t;
-            });
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    MainActivity.guardedThreads("qingmu-prop-debounce"));
     /** AF/拍摄命令在飞标记（UI 线程置位、exec 任务结束清零）：轮询见到任一为真就跳过本轮，不与命令抢通道 */
     private volatile boolean afBusy = false;
     private volatile boolean captureBusy = false;
@@ -570,6 +570,10 @@ public class RemoteController {
             decodeThread = new Thread(this::decodeLoop, "qingmu-lv-decode");
             paceThread = new Thread(this::paceLoop, "qingmu-lv-pace");
             pullThread.setDaemon(true); decodeThread.setDaemon(true); paceThread.setDaemon(true);
+            // v0.6.2：取景三线程同样装未捕获异常拦截（只记 [GUARD]），不许直达系统默认处理器杀进程
+            java.util.function.Consumer<Thread> lvGuard = t -> t.setUncaughtExceptionHandler((th, ex) ->
+                    Diag.op("GUARD", "取景线程 " + th.getName() + " 未捕获异常（已拦截，App 未退出）：" + ex));
+            lvGuard.accept(pullThread); lvGuard.accept(decodeThread); lvGuard.accept(paceThread);
             pullThread.start(); decodeThread.start(); paceThread.start();
         });
     }

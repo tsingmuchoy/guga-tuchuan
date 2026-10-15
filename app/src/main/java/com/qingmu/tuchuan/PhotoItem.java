@@ -3,9 +3,12 @@ package com.qingmu.tuchuan;
 /** 照片墙条目（由 GetObjectInfo 填充） */
 public class PhotoItem {
     public final int handle;
-    public final PtpIpClient.ObjectInfo info;
+    /** v0.6.2：渐进式列表先以占位 ObjectInfo 发布骨架、后台回填时整体替换，故不再 final */
+    public PtpIpClient.ObjectInfo info;
     public boolean selected = false;
     public boolean downloaded = false;
+    /** v0.6.2：骨架条目（信息回填中）——不可下载/删除，缩略图不发请求，回填完成或失败后清除 */
+    public boolean infoPending = false;
     /** v0.6.1：GetObjectInfo 失败的占位条目（句柄真实存在、信息读不到）——列表数量与相机一致，缩略图/下载给中文失败提示 */
     public boolean infoFailed = false;
     /** v0.6.1：占位条目的信息读取失败响应码（进提示与诊断） */
